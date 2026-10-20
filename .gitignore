@@ -1,0 +1,6 @@
+# This folder also holds unrelated files (plans, reports, other projects).
+# Track only the program; add new files here explicitly.
+/*
+!/.gitignore
+!/agent.py
+!/claude_explorer.py
