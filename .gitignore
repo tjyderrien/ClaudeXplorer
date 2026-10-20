@@ -4,3 +4,4 @@
 !/.gitignore
 !/agent.py
 !/claude_explorer.py
+!/USAGE.md
