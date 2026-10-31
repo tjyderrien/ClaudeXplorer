@@ -180,3 +180,9 @@ still followed.
 
 - Grouping relies on keywords in each session's last reply, so a few sessions end up in the wrong group.
 - Offline machines and Windows machines are skipped.
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md). Free for personal use and for charitable, educational, public
+research and government organizations. Any commercial use, including inside a company, needs a commercial
+license: contact the author through [GitHub](https://github.com/tjyderrien).

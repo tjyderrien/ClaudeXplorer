@@ -2,6 +2,6 @@
 # Track only the program; add new files here explicitly.
 /*
 !/.gitignore
-!/agent.py
 !/claude_explorer.py
 !/USAGE.md
+!/LICENSE.md

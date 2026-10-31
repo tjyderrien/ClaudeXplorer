@@ -8,6 +8,9 @@ the local machine is read directly.
     claude-explorer               Claude Code sessions on every host, grouped by how to finish them
     claude-explorer todo          ... as Todoist tasks, with points for finishing them
     claude-explorer dispatch      hand Todoist tasks labelled @claude to Claude Code agents
+
+Required Notice: Copyright 2026 Thibault JY Derrien (https://github.com/tjyderrien)
+Licensed under PolyForm Noncommercial 1.0.0 (see LICENSE.md); commercial use needs a separate license.
 """
 import argparse
 import base64
