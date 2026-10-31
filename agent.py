@@ -1,6 +1,7 @@
 """Runs on each machine (sent over ssh stdin): summarizes local Claude Code sessions as JSON.
 
-Standard library only, Python 3.9+. Usage: python3 -I - --days N < agent.py
+Standard library only, Python 3.9+. Usage: python3 -I - --days N [--config DIR ...] < agent.py
+Each --config is a Claude config dir (one per account); the default is ~/.claude.
 """
 import glob
 import json
@@ -14,6 +15,8 @@ import time
 DAYS = 60
 if "--days" in sys.argv:
     DAYS = float(sys.argv[sys.argv.index("--days") + 1])
+
+CONFIGS = [sys.argv[i + 1] for i, arg in enumerate(sys.argv[:-1]) if arg == "--config"] or ["~/.claude"]
 
 HOME = os.path.expanduser("~")
 NOISE = ("<command", "<local-command", "<system", "<bash-", "<task-notification",
@@ -36,10 +39,10 @@ def text_of(row):
     return "\n".join(parts), has_tool_use, has_tool_result
 
 
-def live_sessions():
+def live_sessions(config):
     """Session id -> registry entry, for processes that are still alive."""
     live = {}
-    for path in glob.glob(os.path.join(HOME, ".claude/sessions/*.json")):
+    for path in glob.glob(os.path.join(os.path.expanduser(config), "sessions/*.json")):
         try:
             entry = json.load(open(path))
             os.kill(int(entry["pid"]), 0)
@@ -123,18 +126,20 @@ def summarize(path, live):
 
 
 def main():
-    live = live_sessions()
     cutoff = time.time() - DAYS * 86400
     sessions = []
-    for path in glob.glob(os.path.join(HOME, ".claude/projects/*/*.jsonl")):
-        if os.path.getmtime(path) < cutoff:
-            continue
-        try:
-            summary = summarize(path, live)
-        except OSError:
-            continue
-        if summary:
-            sessions.append(summary)
+    for config in CONFIGS:
+        live = live_sessions(config)
+        for path in glob.glob(os.path.join(os.path.expanduser(config), "projects/*/*.jsonl")):
+            if os.path.getmtime(path) < cutoff:
+                continue
+            try:
+                summary = summarize(path, live)
+            except OSError:
+                continue
+            if summary:
+                summary["config"] = config
+                sessions.append(summary)
     disk = os.statvfs(HOME)
     json.dump({"host": socket.gethostname(), "home": HOME, "sessions": sessions,
                "home_free_gb": round(disk.f_bavail * disk.f_frsize / 1e9, 1)}, sys.stdout)

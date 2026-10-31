@@ -44,12 +44,17 @@ Optional file `~/.config/claude-explorer.json`:
 ```json
 {
   "exclude": ["Downloads", "bluetooth"],
-  "ssh_users": {"biatri-1": "thibault.derrien"}
+  "ssh_users": {"biatri-1": "thibault.derrien"},
+  "claude_accounts": {"seat2": "~/.claude-seat2"}
 }
 ```
 
 - `exclude`: regular expressions. A session is hidden when its folder or first request matches one.
 - `ssh_users`: the login to use on a host, when it isn't already set in `~/.ssh/config`.
+- `claude_accounts`: extra Claude accounts (for example seats of a Team plan), as name → config directory.
+  `~/.claude` is always read too, as `default`. Sessions of another account show as `host/name`; resume them
+  with `CLAUDE_CONFIG_DIR=<dir> claude --resume`. Log an account in once per host with
+  `CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`.
 
 ## Limits
 

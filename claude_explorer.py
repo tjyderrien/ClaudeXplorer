@@ -12,12 +12,14 @@ Usage:
 
 Optional config ~/.config/claude-explorer.json:
     {"exclude": ["Downloads", "bluetooth"],   # regexes on cwd or first prompt: hide
-     "ssh_users": {"biatri-1": "thibault.derrien"}}
+     "ssh_users": {"biatri-1": "thibault.derrien"},
+     "claude_accounts": {"seat2": "~/.claude-seat2"}}   # name -> CLAUDE_CONFIG_DIR
 """
 import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -26,6 +28,7 @@ from datetime import datetime, timezone
 
 AGENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
 CONFIG = os.path.expanduser("~/.config/claude-explorer.json")
+DEFAULT_CLAUDE = "~/.claude"
 
 # Order is the report order; first matching rule wins.
 STATES = [
@@ -57,6 +60,14 @@ def load_config():
         return {}
 
 
+def claude_accounts(config):
+    """Account name -> Claude config dir; ~/.claude is always one of them."""
+    accounts = dict(config.get("claude_accounts", {}))
+    if DEFAULT_CLAUDE not in accounts.values():
+        accounts = dict([("default", DEFAULT_CLAUDE)] + list(accounts.items()))
+    return accounts
+
+
 def tailnet_hosts():
     """(ssh target, is_self) for the local machine and every online Linux peer."""
     data = json.loads(subprocess.run(["tailscale", "status", "--json"], capture_output=True,
@@ -68,12 +79,15 @@ def tailnet_hosts():
     return hosts
 
 
-def collect(host, is_self, days, users):
-    cmd = [sys.executable, "-I", "-", "--days", str(days)]
+def collect(host, is_self, days, users, configs):
+    args = ["--days", str(days)]
+    for config in configs:
+        args += ["--config", config]
+    cmd = [sys.executable, "-I", "-"] + args
     if not is_self:
         target = "%s@%s" % (users[host], host) if host in users else host
         cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
-               "python3 -I - --days %s" % days]
+               " ".join(["python3", "-I", "-"] + [shlex.quote(a) for a in args])]
     try:
         with open(AGENT) as agent:
             out = subprocess.run(cmd, stdin=agent, capture_output=True, text=True, timeout=180)
@@ -254,7 +268,7 @@ def render(sessions, errors, show_all, markdown, by="method"):
         if key not in seen:  # one git row per folder
             seen.add(key)
             unique.append(s)
-    rows = {s["id"]: [s["host"], project(s), age(s["end"]).replace(" ago", ""), next_step(s)]
+    rows = {s["id"]: [s["host"] + ("/" + s["account"] if s["account"] != "default" else ""), project(s), age(s["end"]).replace(" ago", ""), next_step(s)]
             for s in unique}
     caps = [10, 28, 4]
     w = [min(cap, max([len(h)] + [len(r[i]) for r in rows.values()]))
@@ -287,14 +301,16 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
+    accounts = claude_accounts(config)
+    names = {d: n for n, d in accounts.items()}
     if args.hosts:
         local = os.uname().nodename
         hosts = [(h, h == local) for h in args.hosts.split(",")]
     else:
         hosts = tailnet_hosts()
     with ThreadPoolExecutor(len(hosts)) as pool:
-        results = list(pool.map(
-            lambda h: collect(h[0], h[1], args.days, config.get("ssh_users", {})), hosts))
+        results = list(pool.map(lambda h: collect(h[0], h[1], args.days, config.get("ssh_users", {}),
+                                                  list(accounts.values())), hosts))
 
     exclude = [re.compile(p, re.I) for p in config.get("exclude", [])]
     sessions, errors = [], {}
@@ -306,6 +322,7 @@ def main():
             if any(p.search(s["cwd"]) or p.search(s["first_prompt"]) for p in exclude):
                 continue
             s["host"], s["home"] = data["ssh"], data.get("home", "~")
+            s["account"] = names.get(s.get("config"), s.get("config") or "default")
             sessions.append(s)
     sessions = dedupe(sessions)
     for s in sessions:
