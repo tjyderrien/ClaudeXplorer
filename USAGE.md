@@ -82,7 +82,7 @@ Each run adds a task for every pending session (except running ones) and checks 
 
 Every 100 points is a level; the streak counts consecutive days with at least one finished task. Hosts that
 are offline or unreachable are left alone, so their tasks don't count as finished. To sync regularly, run
-`claude-explorer todo` from cron or a systemd timer.
+`claude-explorer todo` from cron or a systemd timer (see [Running from cron](#running-from-cron)).
 
 ## Todoist tasks done by agents
 
@@ -94,7 +94,7 @@ claude-explorer dispatch --accounts  # which Claude accounts are logged in on ea
 ```
 
 Give a Todoist task the label `@claude`, or put it in the project `Claude-Tasks`, and run
-`claude-explorer dispatch` (by hand, or every few minutes from cron). It starts `claude -p` on a host,
+`claude-explorer dispatch` (by hand, or from cron). It starts `claude -p` on a host,
 detached, with the task title and description as the request:
 
 - **Labels:** real Todoist labels or `@words` typed in the title (`@claude @asus Fix the plots`) both count,
@@ -131,6 +131,19 @@ home directory, and writes them out. Chains such as `squeue && rm x` are refused
 An agent can't wait for long jobs: it submits them, checks they are queued, and ends its report with the job
 IDs and how to check them. `scp` uses the host's own SSH keys and overwrites files at the destination without
 asking, so list it only for hosts on a network you trust. Hosts not listed keep agents without a shell.
+
+### Running from cron
+
+Cron's `PATH` doesn't include `~/.local/bin`, where `claude-explorer` is linked, so set it in the line:
+
+```
+0 8 * * * PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin claude-explorer dispatch >> $HOME/.local/state/claude-explorer/dispatch.log 2>&1
+0 * * * * PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin claude-explorer todo >> $HOME/.local/state/claude-explorer/todo.log 2>&1
+```
+
+Cron has no SSH agent either: the hosts must accept a key ssh finds on its own (`~/.ssh/config` or the
+default key files). A run that falls on a time when the machine is off is skipped, not caught up. Reports of
+agents that finished are posted on the next run, so a daily `dispatch` posts them the following day.
 
 ### Several Claude accounts
 

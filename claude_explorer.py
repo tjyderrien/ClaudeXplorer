@@ -909,7 +909,7 @@ def dispatch_main(argv):
                                  description="Hand Todoist tasks labelled @claude to Claude Code agents on the "
                                              "tailnet, and post their reports back")
     ap.add_argument("--dry-run", action="store_true", help="show what would start, without starting anything")
-    ap.add_argument("--status", action="store_true", help="only list the agents still running")
+    ap.add_argument("--status", action="store_true", help="only list the agents still running and the accounts resting")
     ap.add_argument("--accounts", action="store_true", help="show which Claude accounts are logged in on each host")
     a = ap.parse_args(argv[1:])
     try:
