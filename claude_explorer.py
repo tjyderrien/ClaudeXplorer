@@ -62,9 +62,9 @@ DEFAULT_CONFIG = {
 }
 # `dispatch_shell: true`: SLURM plus read-only file commands and harmless setup.
 SHELL_COMMANDS = ["sbatch", "squeue", "sacct", "sinfo", "scontrol show job",
-                  "ls", "cat", "head", "tail", "grep", "wc", "diff", "mkdir", "cp"]
+                  "ls", "cat", "head", "tail", "grep", "wc", "diff", "mkdir", "cp", "scp"]
 # Refused even if a prefix above would let them through.
-SHELL_DENY = ["rm", "mv", "scancel", "sudo", "ssh", "scp", "curl", "wget", "chmod", "git push"]
+SHELL_DENY = ["rm", "mv", "scancel", "sudo", "ssh", "curl", "wget", "chmod", "git push"]
 
 
 # ---------------------------------------------------------------------------------------------

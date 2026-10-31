@@ -122,14 +122,15 @@ To let agents submit and check SLURM jobs themselves, list the hosts in the conf
 ```
 
 `true` allows commands starting with `sbatch`, `squeue`, `sacct`, `sinfo`, `scontrol show job`, `ls`, `cat`,
-`head`, `tail`, `grep`, `wc`, `diff`, `mkdir` and `cp`; a list (`["sbatch", "squeue"]`) allows exactly those.
+`head`, `tail`, `grep`, `wc`, `diff`, `mkdir`, `cp` and `scp`; a list (`["sbatch", "squeue"]`) allows exactly those.
 Everything else is refused, without asking, because nobody is there to approve it. Even when a prefix would
-allow them, `rm`, `mv`, `scancel`, `sudo`, `ssh`, `scp`, `curl`, `wget`, `chmod` and `git push` are refused,
+allow them, `rm`, `mv`, `scancel`, `sudo`, `ssh`, `curl`, `wget`, `chmod` and `git push` are refused,
 and so is any command containing `$VARIABLES`, `$(...)` or backquotes: the agent is told its user name and
 home directory, and writes them out. Chains such as `squeue && rm x` are refused when any part is.
 
 An agent can't wait for long jobs: it submits them, checks they are queued, and ends its report with the job
-IDs and how to check them. Hosts not listed keep agents without a shell.
+IDs and how to check them. `scp` uses the host's own SSH keys and overwrites files at the destination without
+asking, so list it only for hosts on a network you trust. Hosts not listed keep agents without a shell.
 
 ### Several Claude accounts
 
