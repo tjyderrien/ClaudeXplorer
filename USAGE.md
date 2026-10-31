@@ -102,8 +102,9 @@ detached, with the task title and description as the request:
 - **Where:** a second label naming a host (`@asus`) picks the machine, otherwise the local one. A line
   `dir: ~/Documents/project` in the description, or a description that starts with a path, picks the folder
   (created if missing), otherwise the home directory.
-- **What it may do:** read and edit files (`--permission-mode acceptEdits`). It has no shell
-  (`--disallowedTools Bash`): when the task needs a command or a decision, it says so in its report.
+- **What it may do:** read and edit files (`--permission-mode acceptEdits`). By default it has no shell
+  (`--disallowedTools Bash`): when the task needs a command or a decision, it says so in its report. On hosts
+  listed in `dispatch_shell` it gets a restricted shell (see below).
 - **While it runs:** the label becomes `@claude-running`, and a comment gives the host, folder and session ID.
   The triage shows the session like any other.
 - **When it stops:** the next run posts its final reply as a comment, with the cost and the command to resume
@@ -111,6 +112,24 @@ detached, with the task title and description as the request:
 
 At most `dispatch_max` agents run at once per account (default 3); the others wait for the next run. To run
 a task again, remove its `@claude-done` or `@claude-failed` label.
+
+### Running jobs: a restricted shell on chosen hosts
+
+To let agents submit and check SLURM jobs themselves, list the hosts in the config:
+
+```json
+{"dispatch_shell": {"biatri-1": true, "biatri-2": true}}
+```
+
+`true` allows commands starting with `sbatch`, `squeue`, `sacct`, `sinfo`, `scontrol show job`, `ls`, `cat`,
+`head`, `tail`, `grep`, `wc`, `diff`, `mkdir` and `cp`; a list (`["sbatch", "squeue"]`) allows exactly those.
+Everything else is refused, without asking, because nobody is there to approve it. Even when a prefix would
+allow them, `rm`, `mv`, `scancel`, `sudo`, `ssh`, `scp`, `curl`, `wget`, `chmod` and `git push` are refused,
+and so is any command containing `$VARIABLES`, `$(...)` or backquotes: the agent is told its user name and
+home directory, and writes them out. Chains such as `squeue && rm x` are refused when any part is.
+
+An agent can't wait for long jobs: it submits them, checks they are queued, and ends its report with the job
+IDs and how to check them. Hosts not listed keep agents without a shell.
 
 ### Several Claude accounts
 
@@ -134,8 +153,8 @@ hints include the `CLAUDE_CONFIG_DIR` they need.
 
 ## Configuration
 
-Optional, in `~/.config/claude-explorer.json`. Any key you set overrides the built-in default. When that
-file doesn't exist, the same keys are read from `~/.config/tailmon.json`.
+Optional, in `~/.config/claude-explorer.json`. Any key you set overrides the built-in default. The same keys
+are also read from `~/.config/tailmon.json`, if it exists; `claude-explorer.json` wins.
 
 ```json
 {
@@ -168,6 +187,7 @@ file doesn't exist, the same keys are read from `~/.config/tailmon.json`.
 | `dispatch_project`    | For `dispatch`: project whose tasks all go to agents, labelled or not (default `Claude-Tasks`) |
 | `dispatch_max`        | For `dispatch`: agents running at once, per account (default 3)                      |
 | `dispatch_rest_hours` | For `dispatch`: hours an account is skipped after hitting its usage limit (default 1) |
+| `dispatch_shell`      | For `dispatch`: hosts where agents get a restricted shell: `true` or a list of commands (default none) |
 
 SSH connects with `BatchMode=yes` (it never prompts) and `StrictHostKeyChecking=accept-new`. With Tailscale,
 the host's tailnet address is pinned as `HostName`, so `Host <name>` entries in `~/.ssh/config` still apply.

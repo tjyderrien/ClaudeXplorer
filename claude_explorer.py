@@ -30,7 +30,7 @@ import urllib.request
 import uuid
 
 CONFIG_PATH = os.path.expanduser("~/.config/claude-explorer.json")
-LEGACY_CONFIG = os.path.expanduser("~/.config/tailmon.json")  # read when CONFIG_PATH doesn't exist
+LEGACY_CONFIG = os.path.expanduser("~/.config/tailmon.json")  # read first; CONFIG_PATH overrides it
 STATE_DIR = os.path.expanduser("~/.local/state/claude-explorer")
 LEGACY_STATE = os.path.expanduser("~/.local/state/tailmon")
 DEFAULT_CONFIG = {
@@ -56,7 +56,15 @@ DEFAULT_CONFIG = {
     "dispatch_max": 3,  # per account
     # Hours an account is left alone after one of its agents hit the usage limit.
     "dispatch_rest_hours": 1.0,
+    # Hosts where agents get a restricted shell: hostname -> true (SHELL_COMMANDS) or a list of command
+    # prefixes. Elsewhere agents have no shell at all.
+    "dispatch_shell": {},
 }
+# `dispatch_shell: true`: SLURM plus read-only file commands and harmless setup.
+SHELL_COMMANDS = ["sbatch", "squeue", "sacct", "sinfo", "scontrol show job",
+                  "ls", "cat", "head", "tail", "grep", "wc", "diff", "mkdir", "cp"]
+# Refused even if a prefix above would let them through.
+SHELL_DENY = ["rm", "mv", "scancel", "sudo", "ssh", "scp", "curl", "wget", "chmod", "git push"]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -64,12 +72,17 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------------------------
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    for path in (CONFIG_PATH, LEGACY_CONFIG):
+    for path in (LEGACY_CONFIG, CONFIG_PATH):
         if os.path.exists(path):
             with open(path) as f:
                 cfg.update({k: v for k, v in json.load(f).items() if k in DEFAULT_CONFIG})
-            break
     return cfg
+
+
+def shell_for(cfg, host):
+    """Command prefixes an agent may run on host; empty: no shell."""
+    allowed = {k.lower(): v for k, v in cfg["dispatch_shell"].items()}.get(host.lower())
+    return list(SHELL_COMMANDS) if allowed is True else list(allowed or [])
 
 
 def migrate_state():
@@ -748,7 +761,7 @@ def todo_main(argv):
 # Dispatch: Todoist tasks labelled @claude are handed to an unattended Claude Code agent on a host.
 # ---------------------------------------------------------------------------------------------
 AGENT_LAUNCHER = r'''
-import base64, json, os, shutil, subprocess, sys
+import base64, getpass, json, os, shutil, subprocess, sys
 
 RUN = os.path.expanduser("~/.local/state/claude-explorer/agents")
 LEGACY_RUN = os.path.expanduser("~/.local/state/tailmon/agents")  # agents started by tailmon
@@ -756,6 +769,14 @@ NOTE = ("You were started unattended from a Todoist task by `claude-explorer dis
         "You can read and edit files, but you have no shell. Don't stop to ask questions: do what you can. "
         "If the task needs a command run or a decision made, end your reply with exactly what the user "
         "should run or decide. Your final reply is posted as a comment on the task.")
+NOTE_SHELL = ("You were started unattended from a Todoist task by `claude-explorer dispatch`; nobody is watching. "
+              "You can read and edit files, and you have a restricted shell: only commands starting with %s. "
+              "Anything else is refused, and so is any command using $VARIABLES, $(...) or backquotes: write "
+              "every value literally (your user name is %s, your home directory is %s). Never cancel jobs. "
+              "You cannot wait for long jobs: submit them with sbatch, check they are queued, and end your reply "
+              "with the job IDs, where their output will be and how to check it. Don't stop to ask questions: "
+              "do what you can, and end with exactly what the user should run or decide. Your final reply is "
+              "posted as a comment on the task.")
 
 def emit(value):
     print(json.dumps(value))
@@ -771,6 +792,14 @@ if op == "check" and not os.path.exists(out_path):
 if op == "start":
     folder, config = os.path.expanduser(sys.argv[3]), sys.argv[4]
     name, prompt = (base64.b64decode(x).decode() for x in sys.argv[5:7])
+    shell = json.loads(base64.b64decode(sys.argv[7]).decode()) if len(sys.argv) > 7 else {"allow": []}
+    if shell["allow"]:
+        tools = (["--allowedTools"] + ["Bash(%s:*)" % c for c in shell["allow"]]
+                 + ["--disallowedTools"] + ["Bash(%s:*)" % c for c in shell["deny"]])
+        note = NOTE_SHELL % (", ".join("`%s`" % c for c in shell["allow"]), getpass.getuser(),
+                             os.path.expanduser("~"))
+    else:
+        tools, note = ["--disallowedTools", "Bash"], NOTE
     env = dict(os.environ)
     if config != "~/.claude":  # the default; setting it would also move ~/.claude.json
         env["CLAUDE_CONFIG_DIR"] = os.path.expanduser(config)
@@ -785,8 +814,7 @@ if op == "start":
         os.makedirs(RUN, exist_ok=True)
         with open(out_path, "w") as out:
             p = subprocess.Popen([claude, "-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits",
-                                  "--disallowedTools", "Bash", "--session-id", sid, "--name", name,
-                                  "--append-system-prompt", NOTE],
+                                  "--session-id", sid, "--name", name, "--append-system-prompt", note] + tools,
                                  cwd=folder, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
                                  start_new_session=True)  # survives the ssh session
         emit({"pid": p.pid, "created": created})
@@ -798,7 +826,7 @@ elif op == "check":
         running = False
     try:
         with open(out_path, errors="replace") as f:
-            output = f.read()[-20000:]
+            output = f.read()[-400000:]
     except OSError:
         output = ""
     emit({"running": running, "output": output})
@@ -845,14 +873,25 @@ def relabel(token, task_id, drop, add):
         todoist(token, "POST", "/tasks/" + task_id, {"labels": labels + [add]})
 
 
+def agent_result(output):
+    """The JSON result `claude -p --output-format json` printed; warnings may come before it."""
+    for line in reversed(output.strip().splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                pass
+    return None
+
+
 def agent_report(run, output):
     """(outcome, Todoist comment) for an agent that stopped; outcome is "done", "failed" or "limit"."""
     resume = "Resume: `ssh %s`, then `cd %s && %s`" % (run["node"], run["dir"],
                                                       resume_cmd(run.get("config"), run["sid"]))
-    where = "Agent on %s, account %s" % (run["node"], run.get("account", "default"))
-    try:
-        result = json.loads(output)
-    except ValueError:
+    where = "Agent on %s, account %s%s" % (run["node"], run.get("account", "default"),
+                                          ", restricted shell" if run.get("shell") else "")
+    result = agent_result(output)
+    if result is None:
         outcome = "limit" if LIMIT_RE.search(output[-500:]) else "failed"
         return outcome, "%s, stopped without a result:\n```\n%s\n```\n%s" % (
             where, output.strip()[-3000:] or "(no output)", resume)
@@ -997,25 +1036,30 @@ def dispatch_main(argv):
                 continue
             account = min(free, key=lambda acc: busy.get(acc, 0))
             if a.dry_run:
-                print("would start  [%s %s] %s: %s" % (name, account, folder, title))
+                print("would start  [%s %s%s] %s: %s" % (name, account, ", shell" if shell_for(cfg, name) else "",
+                                                         folder, title))
                 busy[account] = busy.get(account, 0) + 1
                 state["running"]["dry-%s" % task["id"]] = {"account": account}
                 continue
             sid = str(uuid.uuid4())
             prompt = "\n\n".join(x for x in [title, "\n".join(lines).strip()] if x)
+            allow = shell_for(cfg, n["name"])
             started = launcher(n, cfg, is_self, ["start", sid, folder, accounts[account],
                                                  base64.b64encode(("todo: " + title)[:80].encode()).decode(),
-                                                 base64.b64encode(prompt.encode()).decode()])
+                                                 base64.b64encode(prompt.encode()).decode(),
+                                                 base64.b64encode(json.dumps(
+                                                     {"allow": allow, "deny": SHELL_DENY}).encode()).decode()])
             if "error" in started:
                 print("%s: ERROR: %s (%s)" % (n["name"], started["error"], task["content"]), file=sys.stderr)
                 continue
             state["running"][task["id"]] = {"node": n["name"], "sid": sid, "pid": started["pid"], "dir": folder,
                                             "content": title, "started": time.strftime("%m-%d %H:%M"),
-                                            "account": account, "config": accounts[account]}
+                                            "account": account, "config": accounts[account], "shell": bool(allow)}
             save()
             todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
-                    "Agent started on %s with account %s in %s%s (session %s)." % (
-                        n["name"], account, folder, " (folder created)" if started.get("created") else "", sid)})
+                    "Agent started on %s with account %s in %s%s (session %s)%s." % (
+                        n["name"], account, folder, " (folder created)" if started.get("created") else "", sid,
+                        ", with a shell limited to: " + ", ".join(allow) if allow else ", without a shell")})
             relabel(token, task["id"], (label,), label + "-running")
             print("started  [%s %s] %s: %s" % (n["name"], account, folder, title))
     except TodoistError as exc:
