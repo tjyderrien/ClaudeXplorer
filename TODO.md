@@ -7,8 +7,6 @@ How ClaudeExplorer works with [Todoist](https://todoist.com), in both directions
 | Claude → Todoist | `claude-explorer todo` | Every unfinished Claude Code session becomes a task in the project **Claude sessions**. Finishing it earns points. |
 | Todoist → Claude | `claude-explorer dispatch` | Every task labelled **@claude**, or in the project **Claude-Tasks**, is handed to an unattended Claude Code agent. Its report comes back as a comment. |
 
-`tailmon todo` and `tailmon dispatch` run the same commands.
-
 ## Setup
 
 1. Get your API token: Todoist → Settings → Integrations → Developer.
