@@ -8,6 +8,7 @@ the local machine is read directly.
     claude-explorer               Claude Code sessions on every host, grouped by how to finish them
     claude-explorer todo          ... as Todoist tasks, with points for finishing them
     claude-explorer dispatch      hand Todoist tasks labelled @claude to Claude Code agents
+    claude-explorer mark done ID  your own call on whether a session is finished (also: open, note)
 
 Required Notice: Copyright 2026 Thibault JY Derrien (https://github.com/tjyderrien)
 Licensed under PolyForm Noncommercial 1.0.0 (see LICENSE.md); commercial use needs a separate license.
@@ -281,6 +282,7 @@ CLAUDE_STATES = [
     ("UNFINISHED", "Announced more work, never reported back"),
     ("GIT", "Done, but git work not committed/pushed"),
     ("OPEN", "Idle session still open"),
+    ("KEPT", "Kept open by you"),
     ("DONE", "Done"),
 ]
 # How to finish a session, in report order (quickest first).
@@ -291,6 +293,7 @@ CLAUDE_METHODS = [
     ("RESTART", "Restart the task in a new session"),
     ("WAIT", "Running, just wait"),
     ("CLOSE", "Idle, can be closed"),
+    ("KEPT", "Kept open by you"),
     ("DONE", "Done"),
 ]
 LIMIT_RE = re.compile(r"hit your (session|usage) limit|usage limit", re.I)
@@ -383,6 +386,7 @@ def claude_dedupe(sessions):
     for group in groups.values():
         latest = max(group, key=lambda s: s["end"])
         latest["live"] = latest.get("live") or next((s["live"] for s in group if s.get("live")), None)
+        latest["ids"] = [s["id"] for s in group]
         kept.append(latest)
     return kept
 
@@ -392,10 +396,17 @@ def one_line(text, limit):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def ago(ts):
+def epoch(ts):
+    """Seconds since the epoch of a session timestamp (UTC), or None."""
     try:
-        then = calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))  # session timestamps are UTC
-    except ValueError:
+        return calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def ago(ts):
+    then = epoch(ts)
+    if then is None:
         return "?"
     days = (time.time() - then) / 86400
     return "%dh" % (days * 24) if days < 1 else "%dd" % days
@@ -437,7 +448,18 @@ def command_in(reply):
 
 
 def next_step(s):
+    step = auto_step(s)
+    if s.get("again"):
+        step = "[active again since you marked it done] " + step
+    if s.get("note"):
+        step += "  (note: %s)" % s["note"]
+    return step
+
+
+def auto_step(s):
     how = s["method"]
+    if how == "KEPT":
+        return "[kept open] " + s["last_prompt"]
     if how == "COMMAND":
         cmd = command_in(s["last_reply"])
         return ("$ " + cmd) if cmd else gist(s)
@@ -470,11 +492,14 @@ def render_claude(sessions, show_all, by, markdown=False):
         if key not in seen:  # one git row per folder
             seen.add(key)
             unique.append(s)
-    rows = {s["id"]: [s["node"], project(s), ago(s["end"]), next_step(s)] for s in unique}
-    head = ["Host", "Project", "Last", "Next step"]
-    w = [min(cap, max([len(head[i])] + [len(r[i]) for r in rows.values()])) for i, cap in enumerate([16, 28, 4])]
-    rest = max(30, shutil.get_terminal_size((140, 24)).columns - sum(w) - 8)
-    fmt = "  %-{}s  %-{}s  %-{}s  %s".format(*w)
+    ids = short_ids([s["id"] for s in sessions])
+    rows = {s["id"]: [ids[s["id"]], s["node"] + (" (offline)" if s.get("stale") else ""), project(s),
+                      ago(s["end"]), next_step(s)] for s in unique}
+    head = ["ID", "Host", "Project", "Last", "Next step"]
+    w = [min(cap, max([len(head[i])] + [len(r[i]) for r in rows.values()]))
+         for i, cap in enumerate([8, 26, 28, 4])]
+    rest = max(30, shutil.get_terminal_size((140, 24)).columns - sum(w) - 10)
+    fmt = "  %-{}s  %-{}s  %-{}s  %-{}s  %s".format(*w)
     order = [m for m, _ in CLAUDE_METHODS]
     lines = []
     for key, label in groups:
@@ -484,7 +509,7 @@ def render_claude(sessions, show_all, by, markdown=False):
         group.sort(key=lambda s: (order.index(s["method"]), s["end"]) if by == "host" else (s["node"], s["end"]))
         title = "%s (%d)" % (label, len(group))
         if markdown:
-            lines += ["", "## " + title, "", "| " + " | ".join(head) + " |", "|---|---|---|---|"]
+            lines += ["", "## " + title, "", "| " + " | ".join(head) + " |", "|---|---|---|---|---|"]
             lines += ["| " + " | ".join(one_line(x, 300).replace("|", "/") for x in rows[s["id"]]) + " |"
                       for s in group]
         else:
@@ -492,7 +517,7 @@ def render_claude(sessions, show_all, by, markdown=False):
                       fmt % tuple("-" * n for n in w + [min(rest, 40)])]
             for s in group:
                 r = rows[s["id"]]
-                lines.append(fmt % (one_line(r[0], w[0]), one_line(r[1], w[1]), r[2], one_line(r[3], rest)))
+                lines.append(fmt % (r[0], one_line(r[1], w[1]), one_line(r[2], w[2]), r[3], one_line(r[4], rest)))
     return "\n".join(lines)
 
 
@@ -513,7 +538,318 @@ def claude_sessions(cfg, only, days):
     for s in sessions:
         s["state"] = claude_classify(s)
         s["method"] = claude_method(s)
+    apply_marks(sessions, load_json(MARKS_STATE, {}))
     return sessions, errors, skipped, targets
+
+
+# ---------------------------------------------------------------------------------------------
+# Marks: you decide whether a session is finished; your mark wins over the keyword guess.
+# ---------------------------------------------------------------------------------------------
+MARKS_STATE = os.path.join(STATE_DIR, "marks.json")  # session id -> {state, marked, note, node, title}
+LAST_STATE = os.path.join(STATE_DIR, "last.json")    # last triage listing: short ids, offline hosts
+AGAIN_SLACK = 120.0  # activity this long after marking done is the marking turn itself, not new work
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        json.dump(value, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
+def apply_marks(sessions, marks):
+    """Done: hidden like a finished session, unless it was used again after the mark. Open: never hidden."""
+    for s in sessions:
+        found = [marks[i] for i in s.get("ids", [s["id"]]) if i in marks]
+        if not found:
+            continue
+        m = max(found, key=lambda m: m.get("marked", 0))
+        s["note"] = m.get("note")
+        if m.get("state") == "done":
+            if (epoch(s["end"]) or 0) > m.get("marked", 0) + AGAIN_SLACK:
+                s["again"] = True  # keep the keyword guess
+            else:
+                s["state"] = s["method"] = "DONE"
+                s["mark"] = "done"
+        elif m.get("state") == "open":
+            s["mark"] = "open"
+            if s["method"] == "DONE":
+                s["state"] = s["method"] = "KEPT"
+
+
+def short_ids(ids, n=6):
+    """Shortest prefix (at least n characters) that tells every id apart."""
+    ids, out = sorted(set(ids)), {}
+    for i in ids:
+        k = n
+        while any(j != i and j[:k] == i[:k] for j in ids):
+            k += 1
+        out[i] = i[:k]
+    return out
+
+
+def remember(sessions, errors, skipped, days):
+    """Save this listing; return the last known sessions of hosts that are offline or unreachable now."""
+    last = load_json(LAST_STATE, {})
+    away = {r["node"] for r in errors} | {p["name"] for p in skipped if p["os"] == "linux"}
+    cutoff = time.time() - days * 86400
+    kept = {sid: s for sid, s in last.items() if s["node"] in away and (epoch(s["end"]) or 0) > cutoff}
+    save_json(LAST_STATE, dict(kept, **{s["id"]: s for s in sessions}))
+    stale = [dict(s, live=None, stale=True) for s in kept.values()]
+    for s in stale:
+        for k in ("mark", "again", "note"):
+            s.pop(k, None)
+        s["state"] = claude_classify(s)
+        s["method"] = claude_method(s)
+    apply_marks(stale, load_json(MARKS_STATE, {}))
+    return stale
+
+
+def mark_main(argv):
+    if len(argv) < 2 or argv[1] not in ("done", "open", "note"):
+        marks = load_json(MARKS_STATE, {})
+        if len(argv) > 1 and argv[1] not in ("-h", "--help"):
+            sys.exit("claude-explorer mark: use done, open or note (see --help)")
+        if len(argv) > 1:
+            print("usage: claude-explorer mark done|open ID... [-m NOTE]\n"
+                  "       claude-explorer mark note ID TEXT\n"
+                  "       claude-explorer mark                 list your marks\n\n"
+                  "ID is the start of a session id, as in the ID column of the report.")
+            return
+        for sid, m in sorted(marks.items(), key=lambda kv: -kv[1].get("marked", 0)):
+            when = time.strftime("%Y-%m-%d", time.localtime(m["marked"])) if m.get("marked") else "-"
+            print("%-8s %-5s %-10s  %-14s %s%s" % (sid[:8], m["state"] or "note", when, m.get("node") or "?",
+                                                 m.get("title") or "",
+                "  (note: %s)" % m["note"] if m.get("note") else ""))
+        print("%d mark(s); sessions not listed follow the keyword guess" % len(marks))
+        return
+    ap = argparse.ArgumentParser(prog="claude-explorer mark " + argv[1],
+                                 description="Mark Claude sessions as finished or not, overriding the triage's guess")
+    if argv[1] == "note":
+        ap.add_argument("ids", nargs=1, metavar="ID")
+        ap.add_argument("text", help="note shown with the session (empty to clear)")
+    else:
+        ap.add_argument("ids", nargs="+", metavar="ID", help="start of a session id, as in the ID column")
+        ap.add_argument("-m", "--message", help="note shown with the session")
+    a = ap.parse_args(argv[2:])
+    last, marks = load_json(LAST_STATE, {}), load_json(MARKS_STATE, {})
+    known = set(last) | set(marks)
+    for prefix in a.ids:
+        hits = [i for i in known if i.startswith(prefix)]
+        if len(hits) != 1:
+            sys.exit("claude-explorer: %s matches %s; run claude-explorer first, or give more characters"
+                     % (prefix, "no session" if not hits else "%d sessions" % len(hits)))
+        sid, s = hits[0], last.get(hits[0], {})
+        m = marks.setdefault(sid, {"state": None})  # a note alone doesn't change what the triage says
+        m.update(node=s.get("node", m.get("node")),
+                 title=s.get("title") or one_line(s.get("first_prompt") or "", 80) or m.get("title"))
+        if argv[1] != "note":
+            m.update(state=argv[1], marked=time.time())
+        if argv[1] == "note" or a.message is not None:
+            m["note"] = (a.text if argv[1] == "note" else a.message) or None
+        print("%-8s %-5s %-14s %s%s" % (sid[:8], m["state"] or "note", m.get("node") or "?", m.get("title") or "",
+                                        "  (note: %s)" % m["note"] if m.get("note") else ""))
+    save_json(MARKS_STATE, marks)
+
+HTML_PAGE = r"""<title>Claude Explorer Triage</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+/* Layout: one column of sessions grouped by how to finish them, a sticky filter bar; terminal-adjacent, quiet. */
+:root {
+  --bg: #f4f6f5; --surface: #ffffff; --fg: #18211f; --muted: #5b6965; --line: #d9e0dd;
+  --accent: #0f7b6c; --accent-soft: #dcefeb; --warn: #a35a00; --warn-soft: #fbecd6; --done: #7c8a86;
+  --display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #121816; --surface: #19211e; --fg: #e3ebe8; --muted: #93a39e; --line: #2b3632;
+  --accent: #4cc2ae; --accent-soft: #173a33; --warn: #f0a640; --warn-soft: #3a2a12; --done: #6f7d79; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #121816; --surface: #19211e; --fg: #e3ebe8; --muted: #93a39e; --line: #2b3632;
+  --accent: #4cc2ae; --accent-soft: #173a33; --warn: #f0a640; --warn-soft: #3a2a12; --done: #6f7d79; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 15px/1.5 var(--body); }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--bg); }
+.wrap { max-width: 980px; margin: 0 auto; padding-block: 28px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { display: grid; gap: 6px; }
+h1 { font: 600 30px/1.1 var(--display); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.sub, .hosts { color: var(--muted); font: 12.5px/1.6 var(--mono); }
+.hosts .bad { color: var(--warn); }
+.counts { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 10px; font: 500 13px var(--mono); font-variant-numeric: tabular-nums; }
+.counts b { font: 600 22px var(--display); margin-right: 6px; }
+.bar { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--bg); padding-block: 14px 12px;
+  margin-top: 18px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button, .chip { font: 500 13px var(--body); color: var(--muted); background: var(--surface); border: 0; padding: 6px 11px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { border: 1px solid var(--line); border-radius: 999px; padding: 4px 10px; font-family: var(--mono); font-size: 12px; }
+.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+input[type=search] { flex: 1 1 200px; min-width: 0; font: 14px var(--body); color: var(--fg); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+h2 { font: 600 13px var(--display); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 28px 0 4px; }
+.topic { display: grid; grid-template-columns: 4px 1fr; gap: 0 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.stripe { border-radius: 2px; background: var(--accent); }
+.topic.done .stripe { background: var(--line); }
+.topic.again .stripe, .topic.kept .stripe { background: var(--warn); }
+.topic.busy .stripe { background: repeating-linear-gradient(180deg, var(--warn) 0 6px, transparent 6px 10px); }
+.main { min-width: 0; display: grid; gap: 4px; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.title { font: 600 17px/1.3 var(--display); }
+.topic.done .title { color: var(--muted); }
+.pill { font: 500 11px var(--mono); padding: 1px 7px; border-radius: 4px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.quiet { background: transparent; color: var(--done); border: 1px solid var(--line); }
+.meta { color: var(--muted); font: 12.5px/1.5 var(--mono); overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.line { display: grid; grid-template-columns: 52px 1fr; gap: 10px; font-size: 14px; }
+.line > span:first-child { color: var(--muted); font: 11.5px/1.9 var(--mono); text-transform: uppercase; letter-spacing: 0.04em; }
+.line > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.line.next > span:last-child { font-weight: 500; }
+.line.note > span:last-child { color: var(--warn); }
+.cmd { justify-self: start; display: inline-flex; gap: 8px; align-items: center; margin-top: 4px; font: 12px var(--mono); color: var(--muted);
+  background: transparent; border: 1px dashed var(--line); border-radius: 5px; padding: 3px 8px; cursor: pointer; max-width: 100%; }
+.cmd:hover { color: var(--accent); border-color: var(--accent); }
+.cmd code { overflow-wrap: anywhere; text-align: left; }
+.empty { color: var(--muted); padding: 24px 0; }
+@media (max-width: 520px) { .line { grid-template-columns: 1fr; gap: 0; } h1 { font-size: 25px; } }
+</style>
+<div class="wrap">
+  <header>
+    <h1>Claude sessions across the tailnet</h1>
+    <div class="sub" id="sub"></div>
+    <div class="counts" id="counts"></div>
+    <div class="hosts" id="hosts"></div>
+  </header>
+  <div class="bar">
+    <div class="seg" role="group" aria-label="Which sessions">
+      <button id="st-pending" data-st="pending" aria-pressed="true">Pending</button><button id="st-done" data-st="done" aria-pressed="false">Done</button><button id="st-all" data-st="all" aria-pressed="false">All</button>
+    </div>
+    <div class="chips" id="hostchips"></div>
+    <input type="search" id="q" placeholder="Search titles, prompts, replies, folders" aria-label="Search">
+  </div>
+  <main id="list"></main>
+</div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  const D = JSON.parse(document.getElementById("data").textContent);
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+  const ago = (t) => { if (!t) return "?"; const s = Math.max(0, D.generated - t); return s < 3600 ? Math.round(s / 60) + "m" : s < 86400 ? Math.round(s / 3600) + "h" : Math.round(s / 86400) + "d"; };
+  let state = "pending", host = null, q = "";
+  try { state = localStorage.getItem("st") || "pending"; host = localStorage.getItem("host") || null; } catch (e) {}
+
+  $("sub").textContent = "Generated " + new Date(D.generated * 1000).toLocaleString() + " · sessions active in the last " + D.days +
+    " days · read-only; mark sessions with claude-explorer mark";
+  const pending = D.sessions.filter((s) => s.method !== "DONE");
+  const counts = [[pending.length, "pending"], [D.sessions.filter((s) => s.again).length, "active again after done"],
+                  [D.sessions.filter((s) => s.method === "DONE").length, "done"]];
+  counts.forEach(([n, label]) => { const c = el("span"); c.append(el("b", null, String(n)), label); $("counts").append(c); });
+  const hostLine = ["hosts: " + D.reached.join(", ")];
+  if (D.errors.length) hostLine.push("unreachable: " + D.errors.join(", "));
+  if (D.skipped.length) hostLine.push("not checked: " + D.skipped.join(", "));
+  $("hosts").textContent = hostLine.join(" · ");
+
+  const hosts = [...new Set(D.sessions.map((s) => s.node))].sort();
+  if (host && !hosts.includes(host)) host = null;
+  [null, ...hosts].forEach((h) => {
+    const b = el("button", "chip", h || "all hosts"); b.id = "host-" + (h || "all"); b.dataset.h = h || "";
+    b.onclick = () => { host = h; try { h ? localStorage.setItem("host", h) : localStorage.removeItem("host"); } catch (e) {} render(); };
+    $("hostchips").append(b);
+  });
+  document.querySelectorAll(".seg button").forEach((b) => b.onclick = () => { state = b.dataset.st; try { localStorage.setItem("st", state); } catch (e) {} render(); });
+  $("q").oninput = (e) => { q = e.target.value.toLowerCase(); render(); };
+
+  const line = (label, text, cls) => { const d = el("div", "line" + (cls ? " " + cls : "")); d.append(el("span", null, label), el("span", null, text)); return d; };
+  function copyButton(cmd) {
+    const b = el("button", "cmd"); b.type = "button"; b.title = "Copy command"; b.append(el("code", null, cmd), el("span", null, "copy"));
+    b.onclick = () => {
+      const ok = () => { b.lastChild.textContent = "copied"; setTimeout(() => b.lastChild.textContent = "copy", 1500); };
+      const sel = () => { const r = document.createRange(); r.selectNodeContents(b.firstChild); const s = getSelection(); s.removeAllRanges(); s.addRange(r); b.lastChild.textContent = "selected"; };
+      try { navigator.clipboard.writeText(cmd).then(ok, sel); } catch (e) { sel(); }
+    };
+    return b;
+  }
+  function row(s) {
+    const busy = s.live && s.live === "busy";
+    const r = el("article", "topic" + (s.method === "DONE" ? " done" : "") + (s.again ? " again" : "") + (s.method === "KEPT" ? " kept" : "") + (busy ? " busy" : ""));
+    r.append(el("div", "stripe"));
+    const m = el("div", "main"), h = el("div", "head");
+    h.append(el("span", "title", s.title || (s.first || "(untitled)").slice(0, 90)));
+    if (s.live) h.append(el("span", "pill" + (busy ? " warn" : ""), "● " + s.live));
+    if (s.stale) h.append(el("span", "pill quiet", "host offline"));
+    if (s.mark) h.append(el("span", "pill quiet", "marked " + s.mark));
+    if (s.again) h.append(el("span", "pill warn", "active again"));
+    h.append(el("span", "pill quiet", s.state_label));
+    m.append(h);
+    m.append(el("div", "meta", [s.node, s.cwd, "last " + ago(s.end) + " ago", s.account && s.account !== "default" ? "account " + s.account : null, s.short].filter(Boolean).join("  ·  ")));
+    if (s.method !== "DONE") m.append(line("next", s.next, "next"));
+    if (s.first) m.append(line("asked", s.first));
+    if (s.last && s.last !== s.first) m.append(line("last", s.last));
+    if (s.reply) m.append(line("reply", s.reply));
+    if (s.note) m.append(line("note", s.note, "note"));
+    m.append(el("div", "meta", "resume: " + s.resume));
+    m.append(copyButton("claude-explorer mark " + (s.method === "DONE" ? "open " : "done ") + s.short));
+    r.append(m);
+    return r;
+  }
+  function render() {
+    document.querySelectorAll(".seg button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.st === state)));
+    document.querySelectorAll(".chip").forEach((b) => b.setAttribute("aria-pressed", String((b.dataset.h || null) === host)));
+    const list = $("list"); list.replaceChildren();
+    const match = (s) => (!host || s.node === host) && (!q || [s.title, s.first, s.last, s.reply, s.cwd, s.note, s.node, s.next].join(" ").toLowerCase().includes(q));
+    let shown = 0;
+    D.methods.forEach(([key, label]) => {
+      if ((state === "pending" && key === "DONE") || (state === "done" && key !== "DONE")) return;
+      const group = D.sessions.filter((s) => s.method === key && match(s));
+      if (!group.length) return;
+      shown += group.length;
+      list.append(el("h2", null, label + " · " + group.length));
+      group.forEach((s) => list.append(row(s)));
+    });
+    if (!shown) list.append(el("p", "empty", q || host ? "No session matches this filter." : "Nothing here."));
+  }
+  render();
+})();
+</script>
+"""
+
+
+def render_html(sessions, targets, errors, skipped, days):
+    cap = lambda v: v if not v or len(v) <= 600 else v[:599] + "…"
+    ids = short_ids([s["id"] for s in sessions])
+    states = dict(CLAUDE_STATES)
+
+    def tilde(path, home):
+        return "~" + path[len(home):] if path and home and (path + "/").startswith(home + "/") else path or home
+
+    rows = [{"short": ids[s["id"]], "node": s["node"], "cwd": tilde(s["cwd"], s["home"]), "title": s["title"],
+             "method": s["method"], "state_label": states.get(s["state"], s["state"]), "next": next_step(s),
+             "first": cap(s["first_prompt"]), "last": cap(s["last_prompt"]), "reply": cap(s["last_reply"][-600:]),
+             "live": (s.get("live") or {}).get("status") or ("running" if s.get("live") else None),
+             "end": epoch(s["end"]), "note": s.get("note"), "mark": s.get("mark"), "again": s.get("again"),
+             "stale": s.get("stale"), "account": s.get("account"),
+             "resume": "cd %s && %s" % (shlex.quote(s["cwd"] or s["home"]), resume_cmd(s.get("config"), s["id"]))}
+            for s in sorted(sessions, key=lambda s: s["end"], reverse=True)]
+    data = {"generated": time.time(), "days": days, "sessions": rows, "methods": CLAUDE_METHODS,
+            "reached": sorted(n["name"] for n, _ in targets if n["name"] not in {r["node"] for r in errors}),
+            "errors": [r["node"] for r in errors], "skipped": [p["name"] for p in skipped]}
+    # "</" would end the <script> element early
+    return HTML_PAGE.replace("__DATA__", json.dumps(data, ensure_ascii=False).replace("</", "<\\/"))
+
 
 
 def claude_main(argv):
@@ -526,11 +862,14 @@ def claude_main(argv):
     ap.add_argument("--by", choices=["method", "state", "host"], default="method",
                     help="group by how to finish it (default), session state, or host")
     ap.add_argument("--markdown", metavar="FILE", help="also write the report as Markdown to FILE")
+    ap.add_argument("--html", metavar="FILE", help="also write a searchable, read-only HTML page to FILE")
     ap.add_argument("--json", action="store_true", help="print the raw session data as JSON")
     a = ap.parse_args(argv[1:])
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
     sessions, errors, skipped, targets = claude_sessions(cfg, only, a.days)
+    if not only:  # a partial listing would forget the other hosts' sessions
+        sessions += remember(sessions, errors, skipped, a.days)
 
     if a.json:
         print(json.dumps({"sessions": sessions, "errors": errors,
@@ -543,6 +882,9 @@ def claude_main(argv):
         with open(os.path.expanduser(a.markdown), "w") as f:
             f.write("# Claude sessions — %s\n" % time.strftime("%Y-%m-%d %H:%M"))
             f.write(render_claude(sessions, a.all, a.by, markdown=True) + "\n")
+    if a.html:
+        with open(os.path.expanduser(a.html), "w") as f:
+            f.write(render_html(sessions, targets, errors, skipped, a.days))
     for r in errors:
         print("%s: ERROR: %s" % (r["node"], r["error"]), file=sys.stderr)
     if skipped:
@@ -556,8 +898,9 @@ def claude_main(argv):
 TODOIST_API = os.environ.get("TODOIST_API_URL", "https://api.todoist.com/api/v1")
 TODO_STATE = os.path.join(STATE_DIR, "todo.json")
 # Points per way of finishing a session; RUNNING ("WAIT") and DONE sessions get no task.
-TODO_POINTS = {"COMMAND": 10, "GIT": 10, "ANSWER": 15, "RESTART": 25, "CLOSE": 5}
-TODO_VERBS = {"COMMAND": "Run", "GIT": "Commit/push", "ANSWER": "Answer", "RESTART": "Restart", "CLOSE": "Close"}
+TODO_POINTS = {"COMMAND": 10, "GIT": 10, "ANSWER": 15, "RESTART": 25, "CLOSE": 5, "KEPT": 15}
+TODO_VERBS = {"COMMAND": "Run", "GIT": "Commit/push", "ANSWER": "Answer", "RESTART": "Restart", "CLOSE": "Close",
+              "KEPT": "Finish"}
 LEVEL_POINTS = 100
 
 
@@ -662,6 +1005,7 @@ def todo_sync(token, cfg, sessions, reachable, days, dry_run):
     project_id = todo_project(token, cfg["todoist_project"]) if not dry_run else None
     open_ids = {t["id"] for t in todoist_all(token, "/tasks?project_id=" + project_id)} if not dry_run else None
     earned, created, closed = [], [], []
+    marked_done = {todo_key(s) for s in sessions if s.get("mark") == "done"}
 
     def award(key, task, why):
         entry = {"date": time.strftime("%Y-%m-%d"), "time": time.strftime("%H:%M"), "points": task["points"],
@@ -690,7 +1034,7 @@ def todo_sync(token, cfg, sessions, reachable, days, dry_run):
                 del state["tasks"][key]  # older than --days, so not seen: not proof it was finished
             else:
                 # The session no longer needs anything: it was finished outside Todoist.
-                award(key, task, "finished in the session")
+                award(key, task, "marked done" if key in marked_done else "finished in the session")
     state["dismissed"] = {k: v for k, v in state["dismissed"].items() if k in pending}
     for key, s in pending.items():
         if key in state["dismissed"]:
@@ -1069,11 +1413,11 @@ def dispatch_main(argv):
 
 def main():
     argv = sys.argv[1:]
-    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch") else "triage"
+    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch", "mark") else "triage"
     if argv and argv[0] == command:
         argv = argv[1:]
     migrate_state()
-    {"triage": claude_main, "todo": todo_main, "dispatch": dispatch_main}[command]([command] + argv)
+    {"triage": claude_main, "todo": todo_main, "dispatch": dispatch_main, "mark": mark_main}[command]([command] + argv)
 
 
 if __name__ == "__main__":

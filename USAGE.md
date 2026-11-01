@@ -4,6 +4,7 @@ Find, triage and dispatch [Claude Code](https://claude.com/claude-code) work acr
 
 - **Triage.** Lists the Claude Code sessions on every host and groups the unfinished ones by what you have to
   do to finish them: run a command, push git, answer, restart, wait or close.
+- **Your own call.** `mark done` / `mark open` overrides the triage's guess on whether a session is finished.
 - **Todoist tasks and points.** `todo` turns pending sessions into [Todoist](https://todoist.com) tasks and
   gives you points for finishing them.
 - **Agents from Todoist.** `dispatch` goes the other way: Todoist tasks labelled `@claude` are handed to
@@ -38,6 +39,7 @@ claude-explorer --all --days 14         # include finished sessions, last 14 day
 claude-explorer --hosts asus,biatri-1   # only these hosts (works without Tailscale too)
 claude-explorer --markdown report.md    # also write the report as Markdown
 claude-explorer --json                  # raw session data
+claude-explorer --html triage.html      # also write a searchable, read-only web page
 ```
 
 | Group                             | Meaning                                                                         |
@@ -53,6 +55,35 @@ claude-explorer --json                  # raw session data
 To pick a session back up, go to its folder on that machine and run `claude --resume`. Grouping relies on
 keywords in each session's last reply, so a few sessions land in the wrong group. When a task was resumed in
 several sessions, only the most recent is shown.
+
+### Marking sessions done or open
+
+The triage guesses from keywords; you know better. Each session in the report has an ID (the start of its
+session id), and a mark overrides the guess:
+
+```sh
+claude-explorer mark done 96f357 01d74b       # finished: hidden from now on (any unique start of the id)
+claude-explorer mark done 96f357 -m "ran it"  # ... with a note
+claude-explorer mark open 465c9e              # not finished, whatever the triage says
+claude-explorer mark note 01d74b "needs the agent on biatri"   # a note, shown next to the session
+claude-explorer mark                          # list your marks
+```
+
+- **Done** sessions are hidden like finished ones (`--all` shows them). If a session marked done is used
+  again afterwards, it comes back with *[active again since you marked it done]* and the triage's own group.
+  A task resumed in a new session keeps the mark of the session it came from.
+- **Open** sessions that the triage would call done go to the group *Kept open by you*.
+- **Notes** are shown in the *Next step* column; a note alone doesn't change the group.
+- **`todo`** follows the marks: sessions marked done get no task (an open task is closed, and earns its
+  points, "marked done"); sessions kept open get a *Finish* task worth 15 points.
+
+Marks are kept in `~/.local/state/claude-explorer/marks.json` on the machine you run claude-explorer from.
+Each run also saves its listing there (`last.json`): IDs are resolved against it, and hosts that are offline
+or unreachable keep their last known sessions in the report, shown as *(offline)*.
+
+`--html FILE` writes the same report as a single page with search, host filters and Pending / Done / All
+tabs. The page is read-only: each session shows its resume command and the `claude-explorer mark …` command
+to copy.
 
 ## Todoist tasks and points
 
@@ -79,6 +110,7 @@ Each run adds a task for every pending session (except running ones) and checks 
 | Answer the session    | 15     |
 | Restart the task      | 25     |
 | Close an idle session | 5      |
+| Finish a session you kept open | 15 |
 
 Every 100 points is a level; the streak counts consecutive days with at least one finished task. Hosts that
 are offline or unreachable are left alone, so their tasks don't count as finished. To sync regularly, run
@@ -171,34 +203,40 @@ Coupling matrix (design structure matrix): the same components label rows and co
 **M<sub>ij</sub> = 1 when component i uses component j**.
 
 ```
-                         TailMon │  ClaudeExplorer  │        external
-                          1   2  │   3    4    5    │  6   7   8   9  10
-                       ┌─────────┼──────────────────┼────────────────────
- 1 TailMon monitor/fs  │  ■   ·  │   ·    ·    ·    │  ·   1   ·   1   ·
- 2 TailMon forwarder   │  ·   ■  │   1    1    1    │  ·   ·   ·   1   ·
-                       ├─────────┼──────────────────┼────────────────────
- 3 CE triage           │  ·   ·  │   ■    ·    ·    │  ·   1   ·   1   1
- 4 CE todo             │  ·   ·  │   1    ■    ·    │  ·   1   1   1   1
- 5 CE dispatch         │  ·   ·  │   ·    ·    ■    │  ·   1   1   1   1
-                       ├─────────┼──────────────────┼────────────────────
- 6 cron 08:00          │  ·   1  │   ·    ·    ·    │  ■   ·   ·   ·   ·
- 7 Tailscale + SSH     │  ·   ·  │   ·    ·    ·    │  ·   ■   ·   ·   ·
- 8 Todoist             │  ·   ·  │   ·    ·    ·    │  ·   ·   ■   ·   ·
- 9 tailmon.json        │  ·   ·  │   ·    ·    ·    │  ·   ·   ·   ■   ·
-10 claude-explorer.json│  ·   ·  │   ·    ·    ·    │  ·   ·   ·   ·   ■
+                         TailMon │     ClaudeExplorer      │          external
+                          1   2  │   3    4    5    6      │  7   8   9  10  11  12
+                       ┌─────────┼─────────────────────────┼───────────────────────
+ 1 TailMon monitor/fs  │  ■   ·  │   ·    ·    ·    ·      │  ·   1   ·   1   ·   ·
+ 2 TailMon forwarder   │  ·   ■  │   1    1    1    1      │  ·   ·   ·   1   ·   ·
+                       ├─────────┼─────────────────────────┼───────────────────────
+ 3 CE triage           │  ·   ·  │   ■    ·    ·    ·      │  ·   1   ·   1   1   1
+ 4 CE todo             │  ·   ·  │   1    ■    ·    ·      │  ·   1   1   1   1   ·
+ 5 CE dispatch         │  ·   ·  │   ·    ·    ■    ·      │  ·   1   1   1   1   ·
+ 6 CE mark             │  ·   ·  │   1    ·    ·    ■      │  ·   ·   ·   ·   ·   1
+                       ├─────────┼─────────────────────────┼───────────────────────
+ 7 cron 08:00          │  ·   1  │   ·    ·    ·    ·      │  ■   ·   ·   ·   ·   ·
+ 8 Tailscale + SSH     │  ·   ·  │   ·    ·    ·    ·      │  ·   ■   ·   ·   ·   ·
+ 9 Todoist             │  ·   ·  │   ·    ·    ·    ·      │  ·   ·   ■   ·   ·   ·
+10 tailmon.json        │  ·   ·  │   ·    ·    ·    ·      │  ·   ·   ·   ■   ·   ·
+11 claude-explorer.json│  ·   ·  │   ·    ·    ·    ·      │  ·   ·   ·   ·   ■   ·
+12 marks.json          │  ·   ·  │   ·    ·    ·    ·      │  ·   ·   ·   ·   ·   ■
 ```
 
 1 is `tailmon` itself, `search`, `grep` and `mount`; 2 is `tailmon claude|todo|dispatch`, which runs
-`claude-explorer` with the same arguments; 3–5 are `claude-explorer`, `claude-explorer todo` and
-`claude-explorer dispatch` (CE = ClaudeExplorer); 6 is a cron line running `tailmon dispatch`.
+`claude-explorer` with the same arguments; 3–6 are `claude-explorer`, `claude-explorer todo`,
+`claude-explorer dispatch` and `claude-explorer mark` (CE = ClaudeExplorer); 7 is a cron line running
+`tailmon dispatch`; 12 is `~/.local/state/claude-explorer/marks.json` (with `last.json`).
 
-- **One-way coupling.** The TailMon → ClaudeExplorer block (rows 1–2, columns 3–5) holds only row 2, the
-  forwarder. The ClaudeExplorer → TailMon block (rows 3–5, columns 1–2) is empty: ClaudeExplorer never uses
+- **One-way coupling.** The TailMon → ClaudeExplorer block (rows 1–2, columns 3–6) holds only row 2, the
+  forwarder. The ClaudeExplorer → TailMon block (rows 3–6, columns 1–2) is empty: ClaudeExplorer never uses
   TailMon.
-- **One shared resource,** column 9: both read `~/.config/tailmon.json` (it can hold the Todoist token).
+- **One shared resource,** column 10: both read `~/.config/tailmon.json` (it can hold the Todoist token).
 - **Inside ClaudeExplorer,** `todo` builds on the triage (M<sub>43</sub>); `dispatch` stands alone.
-- **Cron** reaches ClaudeExplorer through the forwarder (M<sub>62</sub>). Calling `claude-explorer dispatch`
-  directly moves that 1 to M<sub>65</sub>.
+- **Marks** are written by `mark` (M<sub>6,12</sub>) and read by the triage (M<sub>3,12</sub>); `todo` sees
+  them only through the triage, so M<sub>4,12</sub> stays empty. `mark` resolves IDs against the triage's last
+  listing (M<sub>63</sub>). `tailmon claude mark …` reaches it through the unchanged forwarder (M<sub>26</sub>).
+- **Cron** reaches ClaudeExplorer through the forwarder (M<sub>72</sub>). Calling `claude-explorer dispatch`
+  directly moves that 1 to M<sub>75</sub>.
 
 ## Configuration
 
@@ -247,7 +285,8 @@ still followed.
 
 ## Limits
 
-- Grouping relies on keywords in each session's last reply, so a few sessions end up in the wrong group.
+- Grouping relies on keywords in each session's last reply, so a few sessions end up in the wrong group;
+  `mark done` / `mark open` corrects them.
 - Offline machines and Windows machines are skipped.
 
 ## License
