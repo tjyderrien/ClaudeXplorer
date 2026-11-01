@@ -565,20 +565,37 @@ class TodoistError(Exception):
     pass
 
 
+# Pauses between attempts when Todoist has a temporary problem (about 2 minutes in all).
+RETRY_WAITS = (2, 5, 15, 30, 60)
+RETRY_CODES = {408, 429, 500, 502, 503, 504}
+
+
 def todoist(token, method, path, body=None):
-    req = urllib.request.Request(TODOIST_API + path, method=method,
-                                 data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            raw = r.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise TodoistError("%s %s: HTTP %d %s" % (method, path, exc.code, exc.read()[:200].decode(errors="replace")))
-    except (urllib.error.URLError, OSError) as exc:
-        raise TodoistError("%s %s: %s" % (method, path, exc))
-    return json.loads(raw) if raw else {}
+    # The same request ID on every attempt, so Todoist can drop a repeat of a write it already did.
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+               "X-Request-Id": str(uuid.uuid4())}
+    data = json.dumps(body).encode() if body is not None else None
+    for attempt, wait in enumerate(RETRY_WAITS + (None,)):
+        req = urllib.request.Request(TODOIST_API + path, method=method, data=data, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read()
+            return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            error = "HTTP %d %s" % (exc.code, exc.read()[:200].decode(errors="replace"))
+            if exc.code not in RETRY_CODES:
+                raise TodoistError("%s %s: %s" % (method, path, error))
+            after = exc.headers.get("Retry-After", "")
+            if wait is not None and after.isdigit():
+                wait = max(wait, min(int(after), 300))
+        except (urllib.error.URLError, OSError) as exc:  # network trouble, timeouts
+            error = str(exc)
+        if wait is None:
+            raise TodoistError("%s %s: %s (gave up after %d attempts)" % (method, path, error, attempt + 1))
+        print("Todoist: %s %s: %s; retrying in %ds" % (method, path, error, wait), file=sys.stderr)
+        time.sleep(wait)
 
 
 def todoist_all(token, path):
@@ -969,11 +986,18 @@ def dispatch_main(argv):
             if a.dry_run:
                 print("would report  %s (%s)" % (run["content"], outcome))
                 continue
-            if todoist(token, "GET", "/tasks/" + task_id):
-                todoist(token, "POST", "/comments", {"task_id": task_id, "content": comment})
-                # A usage limit isn't the task's fault: put it back in the queue for another account.
-                relabel(token, task_id, (label, label + "-running"),
-                        label if outcome == "limit" else label + "-" + outcome)
+            try:
+                if todoist(token, "GET", "/tasks/" + task_id):
+                    if not run.get("reported"):  # posted on an earlier run whose relabel failed
+                        todoist(token, "POST", "/comments", {"task_id": task_id, "content": comment})
+                        run["reported"] = True
+                        save()
+                    # A usage limit isn't the task's fault: put it back in the queue for another account.
+                    relabel(token, task_id, (label, label + "-running"),
+                            label if outcome == "limit" else label + "-" + outcome)
+            except TodoistError as exc:
+                print("not reported yet, will try again next run: %s (%s)" % (run["content"], exc), file=sys.stderr)
+                continue
             if outcome == "limit":
                 state["rest"][run.get("account", "default")] = time.time() + cfg["dispatch_rest_hours"] * 3600
             print("%-6s  %s (account %s)" % (outcome, run["content"], run.get("account", "default")))
@@ -1056,11 +1080,14 @@ def dispatch_main(argv):
                                             "content": title, "started": time.strftime("%m-%d %H:%M"),
                                             "account": account, "config": accounts[account], "shell": bool(allow)}
             save()
-            todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
-                    "Agent started on %s with account %s in %s%s (session %s)%s." % (
-                        n["name"], account, folder, " (folder created)" if started.get("created") else "", sid,
-                        ", with a shell limited to: " + ", ".join(allow) if allow else ", without a shell")})
-            relabel(token, task["id"], (label,), label + "-running")
+            try:
+                todoist(token, "POST", "/comments", {"task_id": task["id"], "content":
+                        "Agent started on %s with account %s in %s%s (session %s)%s." % (
+                            n["name"], account, folder, " (folder created)" if started.get("created") else "", sid,
+                            ", with a shell limited to: " + ", ".join(allow) if allow else ", without a shell")})
+                relabel(token, task["id"], (label,), label + "-running")
+            except TodoistError as exc:  # the agent runs anyway; its report will still be posted
+                print("started, but Todoist wasn't updated: %s (%s)" % (title, exc), file=sys.stderr)
             print("started  [%s %s] %s: %s" % (n["name"], account, folder, title))
     except TodoistError as exc:
         sys.exit("claude-explorer: Todoist: %s" % exc)
