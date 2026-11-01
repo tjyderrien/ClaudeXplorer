@@ -89,6 +89,7 @@ are offline or unreachable are left alone, so their tasks don't count as finishe
 ```sh
 claude-explorer dispatch --dry-run   # which @claude tasks would start, and where
 claude-explorer dispatch             # start agents, post the reports of those that stopped
+claude-explorer dispatch --report-only  # post the reports of agents that stopped, start nothing
 claude-explorer dispatch --status    # agents still running, and accounts resting after a usage limit
 claude-explorer dispatch --accounts  # which Claude accounts are logged in on each host
 ```
@@ -107,8 +108,13 @@ detached, with the task title and description as the request:
   listed in `dispatch_shell` it gets a restricted shell (see below).
 - **While it runs:** the label becomes `@claude-running`, and a comment gives the host, folder and session ID.
   The triage shows the session like any other.
+- **Order:** a line `after: <part of another task's title>` in the description makes the task wait until
+  every open task matching it is `@claude-done`.
 - **When it stops:** the next run posts its final reply as a comment, with the cost and the command to resume
-  the session, and sets the label to `@claude-done` (or `@claude-failed`). You read it and close the task.
+  the session, sets the label to `@claude-done` (or `@claude-failed`), and makes the task due today so it
+  shows up in Todoist's Today view. You read it and close the task.
+
+[TODO.md](TODO.md) is the full guide to writing tasks for agents.
 
 At most `dispatch_max` agents run at once per account (default 3); the others wait for the next run. To run
 a task again, remove its `@claude-done` or `@claude-failed` label.
@@ -236,6 +242,7 @@ are also read from `~/.config/tailmon.json`, if it exists; `claude-explorer.json
 | `dispatch_project`    | For `dispatch`: project whose tasks all go to agents, labelled or not (default `Claude-Tasks`) |
 | `dispatch_max`        | For `dispatch`: agents running at once, per account (default 3)                      |
 | `dispatch_rest_hours` | For `dispatch`: hours an account is skipped after hitting its usage limit (default 1) |
+| `dispatch_due_today`  | For `dispatch`: make a task due today when its report is posted, unless it has a due date (default `true`) |
 | `dispatch_shell`      | For `dispatch`: hosts where agents get a restricted shell: `true` or a list of commands (default none) |
 
 SSH connects with `BatchMode=yes` (it never prompts) and `StrictHostKeyChecking=accept-new`. With Tailscale,

@@ -59,6 +59,9 @@ DEFAULT_CONFIG = {
     # Hosts where agents get a restricted shell: hostname -> true (SHELL_COMMANDS) or a list of command
     # prefixes. Elsewhere agents have no shell at all.
     "dispatch_shell": {},
+    # Give a task the due date "today" when its report is posted (unless it already has one), so it shows
+    # up in Todoist's Today view and reminders.
+    "dispatch_due_today": True,
 }
 # `dispatch_shell: true`: SLURM plus read-only file commands and harmless setup.
 SHELL_COMMANDS = ["sbatch", "squeue", "sacct", "sinfo", "scontrol show job",
@@ -927,6 +930,7 @@ def dispatch_main(argv):
                                              "tailnet, and post their reports back")
     ap.add_argument("--dry-run", action="store_true", help="show what would start, without starting anything")
     ap.add_argument("--status", action="store_true", help="only list the agents still running and the accounts resting")
+    ap.add_argument("--report-only", action="store_true", help="post the reports of agents that stopped; start nothing")
     ap.add_argument("--accounts", action="store_true", help="show which Claude accounts are logged in on each host")
     a = ap.parse_args(argv[1:])
     try:
@@ -987,7 +991,8 @@ def dispatch_main(argv):
                 print("would report  %s (%s)" % (run["content"], outcome))
                 continue
             try:
-                if todoist(token, "GET", "/tasks/" + task_id):
+                current = todoist(token, "GET", "/tasks/" + task_id)
+                if current:
                     if not run.get("reported"):  # posted on an earlier run whose relabel failed
                         todoist(token, "POST", "/comments", {"task_id": task_id, "content": comment})
                         run["reported"] = True
@@ -995,6 +1000,8 @@ def dispatch_main(argv):
                     # A usage limit isn't the task's fault: put it back in the queue for another account.
                     relabel(token, task_id, (label, label + "-running"),
                             label if outcome == "limit" else label + "-" + outcome)
+                    if outcome != "limit" and cfg["dispatch_due_today"] and not current.get("due"):
+                        todoist(token, "POST", "/tasks/" + task_id, {"due_string": "today"})
             except TodoistError as exc:
                 print("not reported yet, will try again next run: %s (%s)" % (run["content"], exc), file=sys.stderr)
                 continue
@@ -1003,6 +1010,10 @@ def dispatch_main(argv):
             print("%-6s  %s (account %s)" % (outcome, run["content"], run.get("account", "default")))
             del state["running"][task_id]
             save()
+
+        if a.report_only:
+            print("%d agent(s) running" % len(state["running"]))
+            return
 
         # New @claude tasks: start an agent on the host named by another label, else here.
         # "@word" in the title counts as a label too, as Todoist leaves it as text for unknown labels.
@@ -1034,14 +1045,28 @@ def dispatch_main(argv):
                                else m.group(0), task["content"])
             title = re.sub(r"\s+", " ", title).strip()
             folder = "~"
-            lines = []
+            lines, after = [], []
             for line in (task.get("description") or "").splitlines():
+                dep = re.match(r"\s*after:\s*(.+?)\s*$", line, re.I)
                 m = re.match(r"\s*dir:\s*(.+?)\s*$", line, re.I) or (
                     re.match(r"\s*([~/]\S*)\s*$", line) if not lines and folder == "~" else None)
-                if m:  # "dir: path", or a description that starts with a bare path
+                if dep:  # "after: <part of another task's title, or its ID>"
+                    after.append(dep.group(1))
+                elif m:  # "dir: path", or a description that starts with a bare path
                     folder = m.group(1)
                 elif line.strip() or lines:
                     lines.append(line)
+            # Prerequisites still open must be @claude-done; closed ones count as finished.
+            blocking = []
+            for want in after:
+                for t in tasks:
+                    if t["id"] != task["id"] and (t["id"] == want or want.lower() in t["content"].lower()) \
+                            and lowered + "-done" not in tags(t):
+                        blocking.append("%s%s" % (t["content"][:60], " (failed)" if lowered + "-failed" in tags(t)
+                                                  else ""))
+            if blocking:
+                print("waiting  %s (after: %s)" % (title, "; ".join(blocking)))
+                continue
             # The least busy account logged in on that host, not resting after a usage limit.
             n, is_self = nodes[name]
             if name not in logged_in:
