@@ -2,6 +2,22 @@
 
 Find, triage and dispatch [Claude Code](https://claude.com/claude-code) work across all your machines.
 
+## Why
+
+**Start everything on the run. Run all the code in the cloud. Deliver everything on the ground.**
+
+Starting is easy. Fifty sessions later, half of them are still up in the air. If you multitask by nature, or
+live with ADHD, you know the feeling.
+
+- **Everything in sight:** every session on every machine, in one list.
+- **Sorted by your next move:** run, push, answer or restart.
+- **Hand it off:** `dispatch` gives new Todoist tasks to agents on free machines and seats.
+- **Count what lands:** `todo` scores every finished session, with levels and a streak.
+
+Other dashboards watch your agents. Claude Explorer helps you land them.
+
+## What it does
+
 - **Triage.** Lists the Claude Code sessions on every host and groups the unfinished ones by what you have to
   do to finish them: run a command, push git, answer, restart, wait or close.
 - **Your own call.** `mark done` / `mark open` overrides the triage's guess on whether a session is finished.
