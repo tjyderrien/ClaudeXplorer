@@ -171,6 +171,34 @@ hits its usage limit, the task goes back in the queue (label `@claude` again) an
 for `dispatch_rest_hours` (default 1). Triage and `todo` read the sessions of every account, and resume
 hints include the `CLAUDE_CONFIG_DIR` they need.
 
+## Terminal videos in one folder
+
+`videos` looks through every host for videos (`.mp4 .mkv .webm .mov .avi .ogv .m4v`, GIFs over 1 MB and
+asciinema `.cast` files) and keeps the ones that look like a terminal: CLI tutorials, screencasts of Claude
+Code sessions, demos. They are all copied into one folder.
+
+```sh
+claude-explorer videos --dry-run            # list what would be copied
+claude-explorer videos                      # copy into ~/Videos/CLI-tutorials
+claude-explorer videos --all --dry-run      # also list the videos that were rejected, with their score
+claude-explorer videos --roots ~,/media/thibault --dest ~/CLI-videos
+```
+
+Four frames of each video are decoded at 960x540 with ffmpeg. Each frame is cut into 48 tiles; a tile
+looks like a terminal if it has a flat dark background, sharp text and none of the soft gradients of camera
+footage. The frame's columns are also searched for evenly spaced lines of text. A frame counts as terminal
+with at least 20 % such tiles and 10 text lines, or with 20 text lines, so a terminal beside a browser still
+counts while night scenes and dark renderings don't. A video is kept when at least `--min-score` of its
+frames count (default 25 %). Hosts without ffmpeg stream their videos over SSH to the host with ffmpeg and
+the most free temporary space (videos over `--max-mb` are skipped). The measurements are cached in
+`~/.local/state/claude-explorer/videos.json`, so later runs only look at new or changed files. Copies of the
+same video found in several folders (same name and size) are copied once.
+
+Every video keeps its file name; a different video with the same name gets ` (2)`. A video with the same
+name and size as one already copied counts as a duplicate and isn't copied again. Where each file came from
+is recorded in `.claude-explorer-videos.json` in the destination folder. Light-themed terminals aren't
+detected.
+
 ## How TailMon and ClaudeExplorer fit together
 
 Coupling matrix (design structure matrix): the same components label rows and columns, and

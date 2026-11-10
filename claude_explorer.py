@@ -8,6 +8,7 @@ the local machine is read directly.
     claude-explorer               Claude Code sessions on every host, grouped by how to finish them
     claude-explorer todo          ... as Todoist tasks, with points for finishing them
     claude-explorer dispatch      hand Todoist tasks labelled @claude to Claude Code agents
+    claude-explorer videos        gather the screen recordings of a terminal into one folder
 
 Required Notice: Copyright 2026 Thibault JY Derrien (https://github.com/tjyderrien)
 Licensed under PolyForm Noncommercial 1.0.0 (see LICENSE.md); commercial use needs a separate license.
@@ -858,6 +859,13 @@ def remote_python(node, cfg, is_self, args):
     """Command running `python3 -I - args...` on the node (directly when it is this machine)."""
     if is_self:
         return [sys.executable, "-I", "-"] + args
+    ssh, host = ssh_to(node, cfg)
+    # ssh passes the command through the remote login shell.
+    return ssh + [host] + [shlex.quote(value) for value in ["python3", "-I", "-"] + args]
+
+
+def ssh_to(node, cfg):
+    """(ssh command with options, user@host) for reaching node."""
     user = cfg["users"].get(node["name"], cfg["default_user"])
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
            "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5",
@@ -866,9 +874,7 @@ def remote_python(node, cfg, is_self, args):
         ssh += ["-i", os.path.expanduser(cfg["identity"])]
     if node["dns"] or node["ip"]:
         ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
-    host = "%s@%s" % (user, node["name"]) if user else node["name"]
-    # ssh passes the command through the remote login shell.
-    return ssh + [host] + [shlex.quote(value) for value in ["python3", "-I", "-"] + args]
+    return ssh, "%s@%s" % (user, node["name"]) if user else node["name"]
 
 
 def launcher(node, cfg, is_self, args):
@@ -1119,13 +1125,365 @@ def dispatch_main(argv):
     print("%d agent(s) running" % len([k for k in state["running"] if not k.startswith("dry-")]))
 
 
+# ---------------------------------------------------------------------------------------------
+# Videos: gather the screen recordings of a terminal (CLI tutorials, demos) from every host into one folder.
+# ---------------------------------------------------------------------------------------------
+VIDEO_AGENT = r'''
+import base64, json, os, shutil, subprocess, sys, tempfile
+EXTS = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".ogv", ".m4v", ".gif", ".cast"}
+SKIP = {"node_modules", "site-packages", "miniforge3", "miniconda3", "anaconda3", "nvhpc", "snap", "spack",
+        "__pycache__", "venv", "Trash"}
+W, H = 960, 540
+
+def scan(roots, min_kb):
+    out = []
+    for root in roots:
+        root = os.path.expanduser(root)
+        for d, dirs, files in os.walk(root):
+            dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP]
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext not in EXTS:
+                    continue
+                p = os.path.join(d, f)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if st.st_size < (1024 if ext == ".gif" else min_kb) * 1024 and ext != ".cast":
+                    continue
+                out.append({"path": p, "size": st.st_size, "mtime": int(st.st_mtime)})
+    return out
+
+def text_lines(buf):
+    """Most evenly spaced text lines found in one of 4 column bands: runs of 4-24 rows full of sharp edges,
+    separated by quiet rows, of nearly the same height. Night scenes and renderings have few or none."""
+    best = 0
+    for band in range(4):
+        x0, x1 = band * W // 4, (band + 1) * W // 4
+        edges = []
+        for y in range(H):
+            row = buf[y * W + x0:y * W + x1]
+            edges.append(sum(1 for a, b in zip(row, row[1:]) if abs(a - b) > 50))
+        heights, y = [], 0
+        while y < H:
+            if edges[y] >= 4:
+                top = y
+                while y < H and edges[y] >= 4:
+                    y += 1
+                if 4 <= y - top <= 24:
+                    heights.append(y - top)
+            else:
+                y += 1
+        if heights:
+            mid = sorted(heights)[len(heights) // 2]
+            best = max(best, sum(1 for h in heights if abs(h - mid) <= 2))
+    return best
+
+def frame_score(buf):
+    """[share of the 8x6 tiles with a flat dark background, sharp text and no soft camera gradients,
+    evenly spaced text lines]; video_frame_ok decides from these."""
+    tw, th = W // 8, H // 6
+    good = 0
+    for ty in range(6):
+        for tx in range(8):
+            px = [buf[(ty * th + y) * W + tx * tw + x] for y in range(th) for x in range(tw)]
+            hist = [0] * 256
+            for v in px:
+                hist[v] += 1
+            mode = max(range(256), key=lambda i: sum(hist[max(0, i - 6):i + 7]))
+            n = len(px)
+            flat = sum(hist[max(0, mode - 6):mode + 7]) / n
+            text = sum(c for i, c in enumerate(hist) if abs(i - mode) > 60) / n
+            soft = sum(1 for y in range(0, th, 2) for a, b in zip(px[y * tw:(y + 1) * tw], px[y * tw + 1:(y + 1) * tw])
+                       if 3 <= abs(a - b) <= 20) / ((th + 1) // 2 * (tw - 1))
+            good += mode < 90 and flat >= 0.55 and 0.01 <= text <= 0.45 and soft <= 0.18
+    share = good / 48
+    return [round(share, 2), text_lines(buf) if share >= 0.1 else 0]
+
+def score(path):
+    if path.lower().endswith(".cast"):
+        return {"frames": "cast"}
+    if not shutil.which("ffmpeg"):
+        return {"error": "no ffmpeg"}
+    dur = 0.0
+    try:
+        dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+                                    path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60).stdout)
+    except (ValueError, subprocess.TimeoutExpired):
+        pass
+    notes = []
+    for t in ([dur * f for f in (0.15, 0.4, 0.65, 0.9)] if dur > 2 else [0]):
+        try:
+            buf = subprocess.run(["ffmpeg", "-v", "error", "-ss", "%.2f" % t, "-i", path, "-frames:v", "1",
+                                  "-vf", "scale=%d:%d" % (W, H), "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120).stdout
+        except subprocess.TimeoutExpired:
+            continue
+        if len(buf) != W * H:
+            continue
+        notes.append(frame_score(buf))
+    if not notes:
+        return {"error": "no frame decoded"}
+    return {"frames": notes, "duration": round(dur)}
+
+mode = sys.argv[1]
+if mode == "scan":
+    print(json.dumps({"home": os.path.expanduser("~"), "ffmpeg": bool(shutil.which("ffmpeg")),
+                      "tmp_free": shutil.disk_usage(tempfile.gettempdir()).free,
+                      "files": scan(json.loads(sys.argv[3]), int(sys.argv[2]))}))
+elif mode == "score":
+    print(json.dumps({p: score(p) for p in json.loads(base64.b64decode(sys.argv[2]))}))
+elif mode == "score-stdin":  # the video arrives on stdin from a host without ffmpeg
+    fd, tmp = tempfile.mkstemp(suffix=sys.argv[2])
+    try:
+        with os.fdopen(fd, "wb") as f:
+            shutil.copyfileobj(sys.stdin.buffer, f, 1 << 20)
+        print(json.dumps(score(tmp)))
+    finally:
+        os.unlink(tmp)
+'''
+VIDEO_CACHE = os.path.join(STATE_DIR, "videos.json")
+VIDEO_SCORER = 3  # bump when frame_score's measurements change: cached ones of other versions are redone
+
+
+def video_frame_ok(m):
+    """A frame looks like a terminal: a dark text area and evenly spaced text lines (many lines suffice)."""
+    share, lines = m
+    return (share >= 0.2 and lines >= 10) or lines >= 20
+
+
+def video_score(frames):
+    if frames == "cast":
+        return 1.0
+    return round(sum(map(video_frame_ok, frames)) / len(frames), 2)
+VIDEO_MANIFEST = ".claude-explorer-videos.json"
+
+
+def video_cmd(node, cfg, is_self, args, stdin_script=True):
+    """Run VIDEO_AGENT on node; with stdin_script=False the script is passed with -c so stdin stays free."""
+    if stdin_script:
+        return remote_python(node, cfg, is_self, args)
+    code = "import base64;exec(base64.b64decode(%r))" % base64.b64encode(VIDEO_AGENT.encode()).decode()
+    if is_self:
+        return [sys.executable, "-I", "-c", code] + args
+    ssh, host = ssh_to(node, cfg)
+    return ssh + [host] + [shlex.quote(v) for v in ["python3", "-I", "-c", code] + args]
+
+
+def video_run(node, cfg, is_self, args, timeout):
+    try:
+        r = subprocess.run(video_cmd(node, cfg, is_self, args), input=VIDEO_AGENT, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout"}
+    if r.returncode != 0:
+        return {"error": ((r.stderr.strip().splitlines() or ["exit %d" % r.returncode])[-1])[:160]}
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"error": "unreadable output"}
+
+
+def video_pipe_score(src, analyzer, cfg, path):
+    """Score a video of a host without ffmpeg by streaming it to the analyzer host."""
+    if src[1]:
+        reader = None
+        stdin = open(path, "rb")
+    else:
+        ssh, host = ssh_to(src[0], cfg)
+        reader = subprocess.Popen(ssh + [host, "cat " + shlex.quote(path)], stdout=subprocess.PIPE)
+        stdin = reader.stdout
+    try:
+        r = subprocess.run(video_cmd(analyzer[0], cfg, analyzer[1], ["score-stdin", os.path.splitext(path)[1]],
+                                     stdin_script=False),
+                           stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
+    except subprocess.TimeoutExpired:
+        return {"error": "timeout"}
+    finally:
+        stdin.close()
+        if reader:
+            reader.kill()
+            reader.wait()
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"error": (r.stderr.decode(errors="replace").strip().splitlines() or ["failed"])[-1][:160]}
+
+
+def video_name(dest, manifest, key, path, size):
+    """File name in dest: the original name; a different video with the same name gets ' (2)', ' (3)'…"""
+    if key in manifest:
+        return manifest[key]["file"]
+    stem, ext = os.path.splitext(os.path.basename(path))
+    taken = {v["file"]: v["size"] for v in manifest.values()}
+    for i in range(1, 1000):
+        name = stem + ext if i == 1 else "%s (%d)%s" % (stem, i, ext)
+        if taken.get(name) == size:  # same name and size: the same video already copied from elsewhere
+            return None
+        if name not in taken and not os.path.exists(os.path.join(dest, name)):
+            return name
+    return None
+
+
+def videos_main(argv):
+    ap = argparse.ArgumentParser(prog="claude-explorer videos",
+                                 description="Find the videos on every host that look like a terminal "
+                                             "(CLI tutorials, screen recordings) and copy them into one folder")
+    ap.add_argument("--dest", default="~/Videos/CLI-tutorials", help="folder to gather them in (default %(default)s)")
+    ap.add_argument("--hosts", help="comma-separated host names")
+    ap.add_argument("--roots", default="~", help="comma-separated folders to search on each host (default %(default)s); "
+                                                 "hidden folders and software trees are skipped")
+    ap.add_argument("--min-score", type=float, default=0.25,
+                    help="share of sampled frames that must look like a terminal (default %(default)g)")
+    ap.add_argument("--min-kb", type=int, default=100, help="ignore smaller videos (default %(default)d KB)")
+    ap.add_argument("--max-mb", type=int, default=2000,
+                    help="largest video streamed to another host for scoring when its own host has no ffmpeg "
+                         "(default %(default)d MB)")
+    ap.add_argument("--scan-timeout", type=int, default=3600,
+                    help="seconds allowed for listing one host's files (default %(default)d)")
+    ap.add_argument("--dry-run", action="store_true", help="only list what would be copied")
+    ap.add_argument("--all", action="store_true", help="also list the videos that don't look like a terminal")
+    ap.add_argument("--rescore", action="store_true", help="ignore cached scores")
+    a = ap.parse_args(argv[1:])
+    cfg = load_config()
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    roots = [r for r in a.roots.split(",") if r]
+    targets, skipped = targets_for(cfg, only)
+    dest = os.path.expanduser(a.dest)
+
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        scans = list(ex.map(lambda t: video_run(t[0], cfg, t[1], ["scan", str(a.min_kb), json.dumps(roots)],
+                                                       a.scan_timeout),
+                            targets))
+    try:
+        with open(VIDEO_CACHE) as f:
+            cache = {} if a.rescore else json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    analyzers = [t for t, s in zip(targets, scans) if s.get("ffmpeg")]
+    tmp_free = {t[0]["name"]: s.get("tmp_free", 0) for t, s in zip(targets, scans)}
+    analyzers.sort(key=lambda t: -tmp_free[t[0]["name"]])  # stream videos to the one with most room first
+    has_ffmpeg = {t[0]["name"] for t in analyzers}
+    by_key = {t[0]["name"]: t for t in targets}
+    videos, todo = [], {}  # todo: host name -> [videos to score]
+    for t, s in zip(targets, scans):
+        if "error" in s:
+            print("%s: ERROR: %s%s" % (t[0]["name"], s["error"], "; narrow it with --roots or raise --scan-timeout"
+                                         if s["error"] == "timeout" else ""), file=sys.stderr)
+            continue
+        for v in s["files"]:
+            v.update(host=t[0]["name"], key="%s:%s" % (t[0]["name"], v["path"]))
+            hit = cache.get(v["key"])
+            if hit and (hit["size"], hit["mtime"], hit.get("v")) == (v["size"], v["mtime"], VIDEO_SCORER):
+                v.update(score=video_score(hit["frames"]))
+            else:
+                todo.setdefault(t[0]["name"], []).append(v)
+            videos.append(v)
+    print("%d video(s) on %s; scoring %d" % (len(videos), ", ".join(t[0]["name"] for t in targets),
+                                              sum(len(x) for x in todo.values())), file=sys.stderr)
+
+    def score_host(item):
+        name, vs = item
+        t = by_key[name]
+        if name in has_ffmpeg:
+            res = {}
+            for i in range(0, len(vs), 20):  # in batches: one ssh call per 20 videos
+                chunk = [v["path"] for v in vs[i:i + 20]]
+                r = video_run(t[0], cfg, t[1], ["score", base64.b64encode(json.dumps(chunk).encode()).decode()],
+                              60 + 60 * len(chunk))
+                res.update(r if "error" not in r else {p: r for p in chunk})
+            return [(v, res.get(v["path"], {"error": "missing"})) for v in vs]
+        out = []
+        for v in vs:
+            if v["path"].lower().endswith(".cast"):
+                out.append((v, {"frames": "cast"}))
+            elif not analyzers:
+                out.append((v, {"error": "no host with ffmpeg"}))
+            elif v["size"] > a.max_mb << 20:
+                out.append((v, {"error": "too big to stream for scoring (--max-mb)"}))
+            else:
+                r = {"error": "no host with ffmpeg has room for it"}
+                for analyzer in analyzers:
+                    if tmp_free[analyzer[0]["name"]] > v["size"] + (1 << 30):
+                        r = video_pipe_score(t, analyzer, cfg, v["path"])
+                        if "No space left" not in r.get("error", ""):
+                            break
+                out.append((v, r))
+        return out
+
+    with cf.ThreadPoolExecutor(max_workers=8) as ex:
+        for done in ex.map(score_host, todo.items()):
+            for v, r in done:
+                if "frames" in r:
+                    v["score"] = video_score(r["frames"])
+                    cache[v["key"]] = {"size": v["size"], "mtime": v["mtime"], "frames": r["frames"], "v": VIDEO_SCORER}
+                else:
+                    v["error"] = r["error"]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(VIDEO_CACHE, "w") as f:
+        json.dump(cache, f, indent=1)
+
+    try:
+        with open(os.path.join(dest, VIDEO_MANIFEST)) as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        manifest = {}
+    picked = sorted((v for v in videos if v.get("score", 0) >= a.min_score), key=lambda v: (v["host"], v["path"]))
+    if not a.dry_run:
+        os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for v in picked:
+        name = video_name(dest, manifest, v["key"], v["path"], v["size"])
+        target = os.path.join(dest, name) if name else None
+        have = target and os.path.exists(target) and os.path.getsize(target) == v["size"]
+        status = "duplicate" if not name else "have" if have else "copy"
+        print("%-9s %4.0f%% %8.1f MB  %s:%s%s" % (status, 100 * v["score"], v["size"] / 2 ** 20, v["host"], v["path"],
+                                               "  ->  " + name if name and status == "copy" else ""))
+        if status != "copy":
+            continue
+        if a.dry_run:
+            manifest[v["key"]] = {"file": name, "size": v["size"], "score": v["score"]}  # not saved
+            copied += 1
+            continue
+        node, is_self = by_key[v["host"]]
+        try:
+            if is_self:
+                shutil.copy2(v["path"], target)
+            else:
+                ssh, host = ssh_to(node, cfg)
+                subprocess.run(["rsync", "-t", "--partial", "-s", "-e", " ".join(shlex.quote(x) for x in ssh),
+                                "%s:%s" % (host, v["path"]), target], check=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print("  copy failed: %s" % exc, file=sys.stderr)
+            continue
+        manifest[v["key"]] = {"file": name, "size": v["size"], "score": v["score"]}
+        with open(os.path.join(dest, VIDEO_MANIFEST), "w") as f:
+            json.dump(manifest, f, indent=1)
+        copied += 1
+    if a.all:
+        for v in sorted(videos, key=lambda v: (v["host"], v["path"])):
+            if v.get("score", 0) < a.min_score:
+                print("%-9s %4s  %8.1f MB  %s:%s" % ("no", "%.0f%%" % (100 * v["score"]) if "score" in v else "?",
+                                                    v["size"] / 2 ** 20, v["host"], v["path"]))
+    for v in videos:
+        if "error" in v:
+            print("not scored: %s:%s (%s)" % (v["host"], v["path"], v["error"]), file=sys.stderr)
+    print("%d terminal video(s) found, %d %s to %s" % (len(picked), copied,
+                                                      "would be copied" if a.dry_run else "copied", dest))
+    if skipped:
+        print("not checked: " + ", ".join(
+            "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
+
+
 def main():
     argv = sys.argv[1:]
-    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch") else "triage"
+    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch", "videos") else "triage"
     if argv and argv[0] == command:
         argv = argv[1:]
     migrate_state()
-    {"triage": claude_main, "todo": todo_main, "dispatch": dispatch_main}[command]([command] + argv)
+    {"triage": claude_main, "todo": todo_main, "dispatch": dispatch_main,
+     "videos": videos_main}[command]([command] + argv)
 
 
 if __name__ == "__main__":
