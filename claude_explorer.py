@@ -473,11 +473,11 @@ def render_claude(sessions, show_all, by, markdown=False):
         if key not in seen:  # one git row per folder
             seen.add(key)
             unique.append(s)
-    rows = {s["id"]: [s["node"], project(s), ago(s["end"]), next_step(s)] for s in unique}
-    head = ["Host", "Project", "Last", "Next step"]
-    w = [min(cap, max([len(head[i])] + [len(r[i]) for r in rows.values()])) for i, cap in enumerate([16, 28, 4])]
-    rest = max(30, shutil.get_terminal_size((140, 24)).columns - sum(w) - 8)
-    fmt = "  %-{}s  %-{}s  %-{}s  %s".format(*w)
+    rows = {s["id"]: [s["node"], s["id"][:8], project(s), ago(s["end"]), next_step(s)] for s in unique}
+    head = ["Host", "Hash", "Project", "Last", "Next step"]
+    w = [min(cap, max([len(head[i])] + [len(r[i]) for r in rows.values()])) for i, cap in enumerate([16, 8, 28, 4])]
+    rest = max(30, shutil.get_terminal_size((140, 24)).columns - sum(w) - 10)
+    fmt = "  %-{}s  %-{}s  %-{}s  %-{}s  %s".format(*w)
     order = [m for m, _ in CLAUDE_METHODS]
     lines = []
     for key, label in groups:
@@ -487,7 +487,7 @@ def render_claude(sessions, show_all, by, markdown=False):
         group.sort(key=lambda s: (order.index(s["method"]), s["end"]) if by == "host" else (s["node"], s["end"]))
         title = "%s (%d)" % (label, len(group))
         if markdown:
-            lines += ["", "## " + title, "", "| " + " | ".join(head) + " |", "|---|---|---|---|"]
+            lines += ["", "## " + title, "", "| " + " | ".join(head) + " |", "|---|---|---|---|---|"]
             lines += ["| " + " | ".join(one_line(x, 300).replace("|", "/") for x in rows[s["id"]]) + " |"
                       for s in group]
         else:
@@ -495,7 +495,7 @@ def render_claude(sessions, show_all, by, markdown=False):
                       fmt % tuple("-" * n for n in w + [min(rest, 40)])]
             for s in group:
                 r = rows[s["id"]]
-                lines.append(fmt % (one_line(r[0], w[0]), one_line(r[1], w[1]), r[2], one_line(r[3], rest)))
+                lines.append(fmt % (one_line(r[0], w[0]), r[1], one_line(r[2], w[2]), r[3], one_line(r[4], rest)))
     return "\n".join(lines)
 
 
