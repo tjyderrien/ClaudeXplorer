@@ -461,6 +461,12 @@ def project(s):
     return os.path.basename(s["cwd"].rstrip("/"))
 
 
+def matches_project(s, query):
+    """Every word of query (any case) is in the session's project name or folder."""
+    text = (project(s) + " " + (s["cwd"] or "")).lower()
+    return all(w in text for w in query.lower().split())
+
+
 def render_claude(sessions, show_all, by, markdown=False):
     if by == "host":
         groups = [(h, h) for h in sorted({s["node"] for s in sessions})]
@@ -532,10 +538,14 @@ def claude_main(argv):
                     help="group by how to finish it (default), session state, or host")
     ap.add_argument("--markdown", metavar="FILE", help="also write the report as Markdown to FILE")
     ap.add_argument("--json", action="store_true", help="print the raw session data as JSON")
+    ap.add_argument("--project", action="append", default=[], metavar="WORDS",
+                    help="only sessions whose project or folder has all these words (\"tail mon\"); repeatable")
     a = ap.parse_args(argv[1:])
     cfg = load_config()
     only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
     sessions, errors, skipped, targets = claude_sessions(cfg, only, a.days)
+    if a.project:
+        sessions = [s for s in sessions if any(matches_project(s, q) for q in a.project)]
 
     if a.json:
         print(json.dumps({"sessions": sessions, "errors": errors,

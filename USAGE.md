@@ -38,6 +38,7 @@ claude-explorer --by host               # one table per machine
 claude-explorer --by state              # grouped by session state
 claude-explorer --all --days 14         # include finished sessions, last 14 days
 claude-explorer --hosts asus,biatri-1   # only these hosts (works without Tailscale too)
+claude-explorer --project tailmon       # only sessions whose project or folder has these words
 claude-explorer --markdown report.md    # also write the report as Markdown
 claude-explorer --json                  # raw session data
 ```
