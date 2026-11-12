@@ -9,6 +9,8 @@ Find, triage and dispatch [Claude Code](https://claude.com/claude-code) work acr
 - **Agents from Todoist.** `dispatch` goes the other way: Todoist tasks labelled `@claude` are handed to
   unattended Claude Code agents on your machines, spread over several Claude accounts (for example the seats
   of a Team plan), and their reports come back as comments.
+- **Moving sessions.** `move` carries Claude Code sessions, and the folders they work in, to another
+  host before a machine goes down for maintenance. It only runs when you type it, and asks first.
 - **Zero install on the other hosts.** Hosts are discovered with `tailscale status --json` (or named with
   `--hosts`); each one is read over SSH by piping a small standard-library-only Python script to
   `python3 -`. Nothing is copied or left behind. The local machine is read directly.
@@ -198,6 +200,59 @@ Every video keeps its file name; a different video with the same name gets ` (2)
 name and size as one already copied counts as a duplicate and isn't copied again. Where each file came from
 is recorded in `.claude-explorer-videos.json` in the destination folder. Light-themed terminals aren't
 detected.
+
+## Moving sessions to another host
+
+Before a machine goes down for maintenance, `move` carries its Claude Code sessions to another one, so you
+can go on with `claude --resume` there. It only ever runs when you type it: it prints the plan, asks, copies,
+and leaves everything on the source host as it was.
+
+```sh
+claude-explorer move --from bumblefoot --to biatri-1 --dry-run       # the plan: every session, numbered
+claude-explorer move --from bumblefoot --to biatri-1                 # every session, after asking
+claude-explorer move 12 40-45 --from bumblefoot --to luzicka         # by number from the list
+claude-explorer move "osvc tax" --from bumblefoot --to asus          # by words of the name
+claude-explorer move --from bumblefoot --to luzicka --folder ~/Documents/TailMon   # one project's sessions
+```
+
+A session is chosen by its **number** in the list (`12`, `#12`, or a range like `40-45`), by **words** of
+its name (the title, including one given with `/rename`), its first request or its folder (`"osvc tax"`:
+every word must appear, and all matching sessions are taken), or by the first 6 or more characters of
+its **id**. Numbers are kept for good on each host
+(`~/.local/state/claude-explorer/session-numbers.json`): a session keeps its number from one run to the
+next, and new sessions get the next free ones. Whatever you pick, the plan lists the sessions first, and
+nothing is copied until you answer yes.
+
+For each session it copies the transcript, its subagents and tool results, its rewind checkpoints
+(`file-history`), its `session-env` and the project's memory, into the same Claude account (config dir) on
+the target. The folder a session works in comes along unless:
+
+- **it already exists on the target.** It's left as it is and never merged. The plan shows its git branch
+  and uncommitted changes there, so you can sync with git yourself.
+- **it's over `--max-gb`** (default 2 GB).
+- **you can't create it on the target**, e.g. `/media/...`.
+- **it's in `/tmp`**, a scratchpad.
+- **you gave `--no-folders`.**
+
+A folder is copied whole, with its `.git` and uncommitted changes, but it never goes into other mounts
+below it (sshfs and the like). Subfolders come along with their parent. The plan lists the sessions whose
+folder won't be on the target, so you can copy those yourself before resuming them.
+
+When the home folders differ (`/home/thibault` here, `/home/thibault.derrien` there), paths under the old
+home are rewritten in the transcripts, and each session is filed under the project folder `claude --resume`
+looks in: the one it was started in. Your own files are copied unchanged.
+
+Sessions still open on the source host (running or idle, with a live `claude` process) are refused: exit
+them and run `move` again. The target never replaces a file that already exists, so running `move` twice
+copies nothing new, and memory files already on the target win. If the target's account isn't logged in,
+the plan says so. At the end, `move` checks that every transcript arrived, prints the `ssh` / `cd` /
+`claude --resume` line for each, and logs the move in `~/.local/state/claude-explorer/moves.json`.
+
+The copy goes through the machine running `move` (a tar stream from one SSH connection to the other), so
+the two hosts need no SSH access to each other. Linux and macOS hosts. Nothing is ever deleted: once
+you've checked the sessions on the new host, remove the originals yourself if you want to. Not moved: the
+`↑` prompt history (`~/.claude/history.jsonl`), running jobs and processes, and files outside the
+session's folder.
 
 ## How TailMon and ClaudeExplorer fit together
 

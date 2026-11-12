@@ -9,6 +9,7 @@ the local machine is read directly.
     claude-explorer todo          ... as Todoist tasks, with points for finishing them
     claude-explorer dispatch      hand Todoist tasks labelled @claude to Claude Code agents
     claude-explorer videos        gather the screen recordings of a terminal into one folder
+    claude-explorer move          move Claude Code sessions (and their folders) to another host
 
 Required Notice: Copyright 2026 Thibault JY Derrien (https://github.com/tjyderrien)
 Licensed under PolyForm Noncommercial 1.0.0 (see LICENSE.md); commercial use needs a separate license.
@@ -949,8 +950,8 @@ def dispatch_main(argv):
     accounts = claude_accounts(cfg)
     if a.status:
         for task_id, run in state["running"].items():
-            print("%-12s %-16s %-10s %s  %s" % (run["started"], run["node"], run.get("account", "default"),
-                                                 run["dir"], run["content"]))
+            print("%-12s %-16s %-10s %s  %s  %s" % (run["started"], run["node"], run.get("account", "default"),
+                                                     run["sid"][:8], run["dir"], run["content"]))
         for name, until in sorted(state["rest"].items()):
             if until > time.time():
                 print("account %s rests until %s (usage limit)" % (name, time.strftime("%H:%M", time.localtime(until))))
@@ -994,7 +995,7 @@ def dispatch_main(argv):
                 continue
             outcome, comment = agent_report(run, check["output"])
             if a.dry_run:
-                print("would report  %s (%s)" % (run["content"], outcome))
+                print("would report  [%s %s] %s: %s (%s)" % (run["node"], run["sid"][:8], run["dir"], run["content"], outcome))
                 continue
             try:
                 current = todoist(token, "GET", "/tasks/" + task_id)
@@ -1013,7 +1014,8 @@ def dispatch_main(argv):
                 continue
             if outcome == "limit":
                 state["rest"][run.get("account", "default")] = time.time() + cfg["dispatch_rest_hours"] * 3600
-            print("%-6s  %s (account %s)" % (outcome, run["content"], run.get("account", "default")))
+            print("%-6s  [%s %s %s] %s: %s" % (outcome, run["node"], run.get("account", "default"), run["sid"][:8], run["dir"],
+                                               run["content"]))
             del state["running"][task_id]
             save()
 
@@ -1071,7 +1073,7 @@ def dispatch_main(argv):
                         blocking.append("%s%s" % (t["content"][:60], " (failed)" if lowered + "-failed" in tags(t)
                                                   else ""))
             if blocking:
-                print("waiting  %s (after: %s)" % (title, "; ".join(blocking)))
+                print("waiting  [%s] %s: %s (after: %s)" % (name, folder, title, "; ".join(blocking)))
                 continue
             # The least busy account logged in on that host, not resting after a usage limit.
             n, is_self = nodes[name]
@@ -1084,7 +1086,7 @@ def dispatch_main(argv):
             free = [acc for acc in (pinned or accounts) if acc in logged_in[name]
                     and state["rest"].get(acc, 0) <= time.time() and busy.get(acc, 0) < cfg["dispatch_max"]]
             if not free:
-                print("waiting  %s (no free account on %s: %s)" % (title, name, ", ".join(
+                print("waiting  [%s] %s: %s (no free account: %s)" % (name, folder, title, ", ".join(
                     "%s %s" % (acc, "not logged in" if acc not in logged_in[name] else "resting"
                                if state["rest"].get(acc, 0) > time.time() else "busy")
                     for acc in (pinned or accounts))))
@@ -1119,7 +1121,7 @@ def dispatch_main(argv):
                 relabel(token, task["id"], (label,), label + "-running")
             except TodoistError as exc:  # the agent runs anyway; its report will still be posted
                 print("started, but Todoist wasn't updated: %s (%s)" % (title, exc), file=sys.stderr)
-            print("started  [%s %s] %s: %s" % (n["name"], account, folder, title))
+            print("started  [%s %s %s] %s: %s" % (n["name"], account, sid[:8], folder, title))
     except TodoistError as exc:
         sys.exit("claude-explorer: Todoist: %s" % exc)
     print("%d agent(s) running" % len([k for k in state["running"] if not k.startswith("dry-")]))
@@ -1476,14 +1478,544 @@ def videos_main(argv):
             "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped), file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------------------------
+# Move: carry Claude Code sessions (and the folders they work in) to another host, e.g. before
+# maintenance. Only ever run by hand: it shows a plan, asks, copies, and leaves the originals alone.
+# ---------------------------------------------------------------------------------------------
+MOVE_AGENT = r'''
+import json, os, subprocess, sys, tarfile
+
+op, arg = sys.argv[1], json.loads(sys.argv[2])
+HOME = os.path.expanduser("~")
+
+def emit(value):
+    sys.stdout.write(json.dumps(value) + "\n")
+    sys.stdout.flush()
+
+def walk_one_fs(path):
+    """os.walk that stays on path's filesystem: no sshfs or other mounts below it."""
+    dev = os.lstat(path).st_dev
+    for root, dirs, names in os.walk(path):
+        dirs[:] = [d for d in dirs if os.lstat(os.path.join(root, d)).st_dev == dev]
+        yield root, dirs, names
+
+def size_of(path, cap):
+    """(bytes, files, over): stops counting once over `cap` bytes, so a huge disk is cheap to rule out."""
+    total = files = 0
+    for root, dirs, names in walk_one_fs(path):
+        for n in names:
+            try:
+                total += os.lstat(os.path.join(root, n)).st_size
+            except OSError:
+                continue
+            files += 1
+            if total > cap:
+                return total, files, True
+    return total, files, False
+
+def git_of(path):
+    try:
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain", "-b"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, universal_newlines=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0 or os.path.realpath(path) == os.path.realpath(HOME):
+        return None
+    lines = r.stdout.splitlines()
+    return {"branch": lines[0][3:].split("...")[0] if lines else "", "dirty": max(0, len(lines) - 1)}
+
+if op == "inspect":
+    out = {"home": HOME, "sessions": {}, "sizes": {}, "exists": {}, "logins": {}}
+    for s in arg.get("sessions", []):
+        config = os.path.expanduser(s["config"])
+        paths = [s["path"], s["path"][:-6],  # transcript, and its folder of subagents / tool results
+                 os.path.join(config, "file-history", s["id"]), os.path.join(config, "session-env", s["id"]),
+                 os.path.join(os.path.dirname(s["path"]), "memory")]
+        first = None  # the folder the session was started in: Claude Code files it under that one
+        try:
+            with open(s["path"], errors="replace") as f:
+                for line in f:
+                    if '"cwd"' in line:
+                        try:
+                            first = json.loads(line).get("cwd")
+                        except ValueError:
+                            continue
+                        if first:
+                            break
+        except OSError:
+            pass
+        out["sessions"][s["id"]] = {"paths": [p for p in paths if os.path.exists(p)], "start": first}
+    for p in arg.get("sizes", []):
+        if os.path.isdir(p):
+            size, files, over = size_of(p, arg.get("cap", 1 << 40))
+            out["sizes"][p] = {"bytes": size, "files": files, "over": over, "git": git_of(p),
+                               "mount": os.path.ismount(p)}
+    for p in arg.get("exists", []):
+        out["exists"][p] = os.path.lexists(p)
+    out["writable"] = {}
+    for p in arg.get("writable", []):  # can this folder be created (or written to)?
+        q = p
+        while not os.path.exists(q) and q != os.path.dirname(q):
+            q = os.path.dirname(q)
+        out["writable"][p] = os.access(q, os.W_OK)
+    for c in arg.get("configs", []):
+        out["logins"][c] = os.path.exists(os.path.join(os.path.expanduser(c), ".credentials.json"))
+    emit(out)
+elif op == "pack":  # tar.gz of these paths (files or folders) on stdout, names without the leading "/"
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as tar:
+        for p in arg["paths"]:
+            try:
+                if not os.path.isdir(p) or os.path.islink(p):
+                    tar.add(p, arcname=p.lstrip("/"))
+                    continue
+                for root, dirs, names in walk_one_fs(p):
+                    for x in [root] + [os.path.join(root, n) for n in names] + \
+                             [os.path.join(root, d) for d in dirs if os.path.islink(os.path.join(root, d))]:
+                        try:
+                            tar.add(x, arcname=x.lstrip("/"), recursive=False)
+                        except OSError as e:
+                            sys.stderr.write("pack: skipped %s\n" % e)
+            except OSError as e:
+                sys.stderr.write("pack: %s\n" % e)
+elif op == "unpack":  # extract a tar from stdin under the allowed roots; never replace anything
+    roots = [os.path.normpath(r) for r in arg["roots"]]
+    written = skipped = failed = 0
+    errors = []
+    with tarfile.open(fileobj=sys.stdin.buffer, mode="r|gz") as tar:
+        for m in tar:
+            dest = os.path.normpath("/" + m.name)
+            if not any(dest == r or dest.startswith(r + "/") for r in roots) or ".." in m.name.split("/"):
+                failed += 1
+                errors.append("outside the allowed folders: %s" % dest)
+                continue
+            if m.isdir():
+                os.makedirs(dest, exist_ok=True)
+                continue
+            if os.path.lexists(dest):
+                skipped += 1
+                continue
+            try:
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                if hasattr(tarfile, "tar_filter"):
+                    tar.extract(m, "/", filter="tar")
+                else:
+                    tar.extract(m, "/")
+                written += 1
+            except (OSError, tarfile.TarError) as e:
+                failed += 1
+                errors.append(str(e))
+    emit({"written": written, "skipped": skipped, "failed": failed, "errors": errors[:10]})
+'''
+MOVE_STATE = os.path.join(STATE_DIR, "moves.json")
+MOVE_NUMBERS = os.path.join(STATE_DIR, "session-numbers.json")
+
+
+def number_sessions(host, sessions):
+    """Session id -> number on this host. A number, once given, is kept for good (also after the session
+    is gone), so #12 means the same session in every listing; new sessions get the next ones."""
+    try:
+        with open(MOVE_NUMBERS) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    nums = dict(saved.get(host, {}))
+    nxt = max(nums.values(), default=0) + 1
+    for s in sorted(sessions, key=lambda s: (s["cwd"], s["end"])):
+        if s["id"] not in nums:
+            nums[s["id"]], nxt = nxt, nxt + 1
+    if nums != saved.get(host):
+        saved[host] = nums
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(MOVE_NUMBERS + ".tmp", "w") as f:
+            json.dump(saved, f, indent=1)
+        os.replace(MOVE_NUMBERS + ".tmp", MOVE_NUMBERS)
+    return nums
+
+
+def pick_sessions(sessions, nums, selectors, home):
+    """Sessions named by number (12, #12, 12-15), id prefix (6+ hex characters) or words of their title,
+    first request or folder ("osvc tax": every word must appear). Returns (chosen, [(selector, count)])."""
+    def tilde(p):
+        return "~" + p[len(home):] if under(p, home) else p
+
+    chosen, counts = [], []
+    for x in selectors:
+        bare = x.strip().lstrip("#")
+        rng = re.fullmatch(r"(\d{1,5})(?:-(\d{1,5}))?", bare)
+        if rng and (x.strip().startswith("#") or len(bare) < 6):
+            lo, hi = int(rng.group(1)), int(rng.group(2) or rng.group(1))
+            hit = [s for s in sessions if lo <= nums.get(s["id"], 0) <= hi]
+        elif re.fullmatch(r"[0-9a-f-]{6,36}", bare.lower()):
+            hit = [s for s in sessions if s["id"].startswith(bare.lower())]
+        else:
+            words = bare.lower().split()
+            hit = [s for s in sessions
+                   if all(w in " ".join((s["title"], s["first_prompt"], tilde(s["cwd"]))).lower() for w in words)]
+        counts.append((x, len(hit)))
+        chosen += [s for s in hit if s not in chosen]
+    return chosen, counts
+MOVE_MAX_GB = 2.0
+
+
+def move_cmd(node, cfg, is_self, op, arg):
+    """Run MOVE_AGENT on node with -c, so stdin stays free for `unpack`."""
+    code = "import base64;exec(base64.b64decode(%r))" % base64.b64encode(MOVE_AGENT.encode()).decode()
+    args = ["python3", "-I", "-c", code, op, json.dumps(arg)]
+    if is_self:
+        return [sys.executable] + args[1:]
+    ssh, host = ssh_to(node, cfg)
+    return ssh + [host] + [shlex.quote(v) for v in args]
+
+
+def move_inspect(node, cfg, is_self, arg):
+    r = subprocess.run(move_cmd(node, cfg, is_self, "inspect", arg), stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=900)
+    if r.returncode != 0:
+        sys.exit("claude-explorer: %s: %s" % (node["name"], (r.stderr.strip().splitlines() or
+                                                            ["exit %d" % r.returncode])[-1][:200]))
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def project_dir_name(path):
+    """Claude Code's folder name for a working directory under projects/."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def home_rewriter(old, new):
+    """Rewrite the source home to the target's in transcript text (JSON lines): /home/a/x -> /home/b/x,
+    but not /home/a.b or /home/ab."""
+    if old == new:
+        return None
+    # Not after a letter, dot or dash, except the n / t / r of a JSON escape (\n/home/a/... in a command).
+    pat = re.compile(r"(?:(?<![\w.-])|(?<=\\[ntr]))%s(?=/|\"|'|\\|\s|$|[:;,)\]}])" % re.escape(old))
+    return lambda text: pat.sub(lambda m: new, text)
+
+
+def move_stream(src, dst, cfg, paths, rename, roots, rewrite, label):
+    """Pack `paths` on src, rename (and rewrite transcripts) here, unpack on dst. Returns dst's report."""
+    import io
+    import tarfile
+    import threading
+    pack = subprocess.Popen(move_cmd(src[0], cfg, src[1], "pack", {"paths": paths}), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    unpack = subprocess.Popen(move_cmd(dst[0], cfg, dst[1], "unpack", {"roots": roots}), stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    pack_err = []
+    threading.Thread(target=lambda: pack_err.extend(pack.stderr.read().decode(errors="replace").splitlines()),
+                     daemon=True).start()
+    moved, last = [0], [time.time()]
+
+    def progress(n):
+        moved[0] += n
+        if sys.stderr.isatty() and time.time() - last[0] > 1:
+            last[0] = time.time()
+            sys.stderr.write("\r  %s: %s copied\033[K" % (label, human_bytes(moved[0])))
+            sys.stderr.flush()
+
+    try:
+        with tarfile.open(fileobj=pack.stdout, mode="r|gz") as tin, \
+                tarfile.open(fileobj=unpack.stdin, mode="w|gz") as tout:
+            for m in tin:
+                # Long names travel in PAX headers, which would win over the new name and size.
+                m.pax_headers = {k: v for k, v in m.pax_headers.items() if k not in ("path", "linkpath", "size")}
+                m.name = rename("/" + m.name).lstrip("/")
+                if m.issym() and m.linkname.startswith("/"):
+                    m.linkname = rename(m.linkname)
+                elif m.islnk():  # hard links name another member of the archive
+                    m.linkname = rename("/" + m.linkname).lstrip("/")
+                if m.isfile():
+                    data = tin.extractfile(m)
+                    if rewrite and m.name.endswith(".jsonl"):
+                        body = rewrite(data.read().decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+                        m.size = len(body)
+                        data = io.BytesIO(body)
+                    tout.addfile(m, data)
+                    progress(m.size)
+                else:
+                    tout.addfile(m)
+    except (OSError, EOFError, tarfile.TarError) as e:
+        pack.kill()
+        pack_err.append(str(e))
+    finally:
+        try:
+            unpack.stdin.close()
+        except OSError:
+            pass
+    if sys.stderr.isatty():
+        sys.stderr.write("\r\033[K")
+    out, err = unpack.stdout.read(), unpack.stderr.read()  # stdin is already closed: no communicate()
+    unpack.wait()
+    pack.wait()
+    try:
+        report = json.loads(out.decode().strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        report = {"written": 0, "skipped": 0, "failed": 1,
+                  "errors": [(err.decode(errors="replace").strip().splitlines() or ["unpack failed"])[-1]]}
+    if pack.returncode not in (0, None) or [e for e in pack_err if e.strip()]:
+        report["failed"] = report.get("failed", 0) + 1
+        report.setdefault("errors", []).extend([e for e in pack_err if e.strip()][-3:] or
+                                               ["pack exited %d" % pack.returncode])
+    report["bytes"] = moved[0]
+    return report
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1024.0
+
+
+def find_host(cfg, name):
+    """(node, is_self) for a host name, online, of an OS that runs the move agent."""
+    try:
+        me, peers = discover()
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        local = os.uname().nodename.split(".")[0]
+        return {"name": name, "dns": None, "ip": None, "os": "linux", "online": True}, name == local
+    for n in [me] + peers:
+        if n["name"] == name:
+            if n is not me and not n["online"]:
+                sys.exit("claude-explorer: %s is offline" % name)
+            if n["os"] not in ("linux", "macOS"):
+                sys.exit("claude-explorer: %s runs %s; moves need Linux or macOS" % (name, n["os"]))
+            return n, n is me
+    sys.exit("claude-explorer: no host named %s on the tailnet" % name)
+
+
+def move_main(argv):
+    ap = argparse.ArgumentParser(
+        prog="claude-explorer move",
+        description="Move Claude Code sessions from one host to another (before maintenance, say): the "
+                    "transcripts, their checkpoints and memory, and the folders they work in. Shows the plan "
+                    "and asks first; nothing on the source host is changed or deleted.")
+    ap.add_argument("sessions", nargs="*", metavar="SESSION",
+                    help="which sessions: numbers from the list (12, 12-15), words of their name, request or "
+                         "folder (\"osvc tax\"), or ids (6+ first characters); none: every session of the host")
+    ap.add_argument("--from", dest="src", required=True, metavar="HOST", help="host the sessions are on")
+    ap.add_argument("--to", dest="dst", required=True, metavar="HOST", help="host to move them to")
+    ap.add_argument("--folder", action="append", default=[], metavar="DIR",
+                    help="only sessions working in DIR or below (~ is the source home); repeatable")
+    ap.add_argument("--days", type=float, default=3650, help="only sessions active in the last N days")
+    ap.add_argument("--max-gb", type=float, default=MOVE_MAX_GB,
+                    help="don't copy a folder bigger than this (default %(default)g GB); its sessions still move")
+    ap.add_argument("--no-folders", action="store_true", help="move the sessions only, copy no folders")
+    ap.add_argument("--dry-run", action="store_true", help="show the plan and stop")
+    ap.add_argument("--yes", action="store_true", help="don't ask before copying")
+    a = ap.parse_args(argv[1:])
+    cfg = load_config()
+    if a.src == a.dst:
+        ap.error("--from and --to are the same host")
+    src, dst = find_host(cfg, a.src), find_host(cfg, a.dst)
+    accounts = claude_accounts(cfg)
+    names = {d: n for n, d in accounts.items()}
+
+    # 1. The sessions of the source host (every transcript, not only the latest of a resumed chain).
+    data = claude_on_host(src[0], cfg, src[1], a.days)
+    if "error" in data:
+        sys.exit("claude-explorer: %s: %s" % (a.src, data["error"]))
+    src_home = data["home"]
+    sessions = data["sessions"]
+    for s in sessions:
+        s["cwd"] = s["cwd"] or src_home
+    nums = number_sessions(a.src, sessions)
+    if a.sessions:
+        sessions, counts = pick_sessions(sessions, nums, a.sessions, src_home)
+        missing = [x for x, n in counts if not n]
+        if missing:
+            sys.exit("claude-explorer: no session matches %s on %s (see the list: --dry-run)" % (
+                ", ".join(repr(x) for x in missing), a.src))
+        for x, n in counts:
+            if n > 1:
+                print("%r matches %d sessions" % (x, n))
+    if a.folder:
+        roots = [os.path.normpath(f.replace("~", src_home, 1) if f.startswith("~") else f) for f in a.folder]
+        sessions = [s for s in sessions if any(under(s["cwd"] or src_home, r) for r in roots)]
+    if not sessions:
+        sys.exit("claude-explorer: no session to move on %s" % a.src)
+    for s in sessions:
+        s["state"] = claude_classify(s)
+    live = [s for s in sessions if s.get("live")]
+    sessions = [s for s in sessions if not s.get("live")]
+
+    # 2. What each session needs, on both hosts.
+    cap = int(a.max_gb * 2**30)
+    scratch = lambda p: under(p, "/tmp") and not under(p, src_home)  # Claude's scratchpads and the like
+    folders = sorted({s["cwd"] for s in sessions if not scratch(s["cwd"]) and s["cwd"] != src_home})
+    if a.no_folders:
+        folders = []
+    info = move_inspect(src[0], cfg, src[1], {"sessions": [{"id": s["id"], "path": s["path"], "config": s["config"]}
+                                                           for s in sessions], "sizes": folders, "cap": cap})
+    dst_probe = move_inspect(dst[0], cfg, dst[1], {"configs": sorted({s["config"] for s in sessions})})
+    dst_home = dst_probe["home"]
+
+    def translate(path):
+        return dst_home + path[len(src_home):] if under(path, src_home) else path
+
+    renames = {}  # source path prefix -> target path prefix, longest first when applied
+    for s in sessions:
+        old_dir = os.path.dirname(s["path"])
+        # `claude --resume` finds a session from the folder it was started in (its projects/ folder name),
+        # which may not be the last folder it worked in.
+        start = (info["sessions"].get(s["id"]) or {}).get("start")
+        project = next((p for p in (start, s["cwd"]) if p and project_dir_name(p) == os.path.basename(old_dir)), None)
+        new_dir = os.path.dirname(translate(s["path"]))
+        if project:
+            new_dir = os.path.join(os.path.dirname(new_dir), project_dir_name(translate(project)))
+        elif src_home != dst_home:
+            print("warning: %s: can't tell which folder %s stands for; it keeps that name" % (
+                s["id"][:8], os.path.basename(old_dir)), file=sys.stderr)
+        renames[old_dir] = new_dir
+        s["new_cwd"] = translate(s["cwd"])
+        s["resume_in"] = translate(project or s["cwd"])
+        s["new_path"] = os.path.join(new_dir, os.path.basename(s["path"]))
+    renames[src_home] = dst_home
+    order = sorted(renames, key=len, reverse=True)
+
+    def rename(path):
+        for p in order:
+            if under(path, p):
+                return renames[p] + path[len(p):]
+        return path
+
+    there_info = move_inspect(dst[0], cfg, dst[1], {"exists": [s["new_path"] for s in sessions] +
+                                                    [translate(f) for f in folders],
+                                                    "writable": [translate(f) for f in folders],
+                                                    "sizes": [translate(f) for f in folders], "cap": 0})
+    exists = there_info["exists"]
+    copy = []
+    folder_note = {}
+    for f in folders:  # parents first: a copied parent brings its subfolders along
+        size = info["sizes"].get(f)
+        parent = next((g for g in copy if under(f, g)), None)
+        if parent:
+            folder_note[f] = "comes with %s" % parent
+        elif exists.get(translate(f)):
+            git = (there_info["sizes"].get(translate(f)) or {}).get("git")
+            folder_note[f] = "already on %s%s, left as it is" % (
+                a.dst, " (git %s, %d uncommitted there)" % (git["branch"], git["dirty"]) if git else "")
+        elif size is None:
+            folder_note[f] = "missing on %s, nothing to copy" % a.src
+        elif size["over"]:
+            folder_note[f] = "over %g GB: NOT copied (--max-gb, or copy it yourself)" % a.max_gb
+        elif not there_info["writable"].get(translate(f)):
+            folder_note[f] = "you can't create %s on %s: NOT copied" % (translate(f), a.dst)
+        else:
+            copy.append(f)
+            folder_note[f] = "copy, %s in %d files%s" % (human_bytes(size["bytes"]), size["files"],
+                                                         ", git %s, %d uncommitted" % (size["git"]["branch"],
+                                                                                       size["git"]["dirty"])
+                                                         if size["git"] else "")
+    todo = [s for s in sessions if not exists.get(s["new_path"])]
+    there = [s for s in sessions if exists.get(s["new_path"])]
+
+    # 3. The plan.
+    print("Move from %s (%s) to %s (%s)" % (a.src, src_home, a.dst, dst_home))
+    def tilde(p):
+        return "~" + p[len(src_home):] if under(p, src_home) else p
+
+    def row(s, extra=""):
+        return "  #%-4d %-46s %-11s %-4s %s%s" % (nums[s["id"]], one_line(s["title"] or s["first_prompt"], 46),
+                                                 s["state"].lower(), ago(s["end"]), tilde(s["cwd"]), extra)
+
+    print("\nSessions (%d to move%s):" % (len(todo), ", %d already there" % len(there) if there else ""))
+    for s in sorted(todo, key=lambda s: nums[s["id"]]):
+        print(row(s))
+    if live:
+        print("\nStill open on %s, NOT moved (exit them first, then run this again):" % a.src)
+        for s in sorted(live, key=lambda s: nums[s["id"]]):
+            print(row(s, "  (pid %s)" % s["live"]["pid"]))
+    if folders:
+        print("\nFolders:")
+        for f in folders:
+            shown = f if translate(f) == f else "%s -> %s" % (f, translate(f))
+            print("  %s: %s" % (shown, folder_note[f]))
+    homeless = sorted({s["cwd"] for s in todo if s["cwd"] != src_home and not exists.get(translate(s["cwd"]))
+                       and not any(under(s["cwd"], f) for f in copy)})
+    if homeless:
+        print("\nThese sessions move, but their folder won't be on %s; copy it before resuming them:" % a.dst)
+        for f in homeless:
+            print("  " + f)
+    no_login = [c for c, ok in dst_probe["logins"].items() if not ok]
+    if no_login:
+        print("\nNot logged in on %s: %s (log in there with `%s` and /login)" % (
+            a.dst, ", ".join(names.get(c, c) for c in no_login),
+            "; ".join(resume_cmd(c).replace(" --resume", "") for c in no_login)))
+    if src_home != dst_home:
+        print("\nPaths under %s are rewritten to %s in the transcripts." % (src_home, dst_home))
+    total = sum(info["sizes"][f]["bytes"] for f in copy)
+    if not todo and not copy:
+        print("\nNothing to do.")
+        return
+    if a.dry_run:
+        print("\nDry run: nothing copied.")
+        return
+    if not a.yes:
+        try:
+            answer = input("\nCopy %d session(s) and %d folder(s) (%s) to %s? [y/N] " % (
+                len(todo), len(copy), human_bytes(total), a.dst))
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() not in ("y", "yes", "o", "oui"):
+            print("Nothing copied.")
+            return
+
+    # 4. Copy: sessions first (small), then each folder. The target never replaces an existing file.
+    rewrite = home_rewriter(src_home, dst_home)
+    failed = False
+    session_paths = sorted({p for s in todo for p in (info["sessions"].get(s["id"]) or {}).get("paths", [])})
+    # where the target may write: its home, and account dirs that live outside it
+    roots = sorted({dst_home} | {os.path.dirname(rename(p)) for p in session_paths if not under(p, src_home)})
+    if session_paths:
+        r = move_stream(src, dst, cfg, session_paths, rename, roots, rewrite, "sessions")
+        print("sessions: %d files written, %d already there%s" % (r["written"], r["skipped"],
+                                                                 ", %d FAILED" % r["failed"] if r["failed"] else ""))
+        for e in r.get("errors", []):
+            print("  " + e, file=sys.stderr)
+        failed |= bool(r["failed"])
+    for f in copy:
+        r = move_stream(src, dst, cfg, [f], rename, [translate(f)], None, f)
+        print("%s: %s, %d files written%s" % (translate(f), human_bytes(r["bytes"]), r["written"],
+                                             ", %d FAILED" % r["failed"] if r["failed"] else ""))
+        for e in r.get("errors", []):
+            print("  " + e, file=sys.stderr)
+        failed |= bool(r["failed"])
+
+    # 5. Check, remember, and say how to go on.
+    check = move_inspect(dst[0], cfg, dst[1], {"exists": [s["new_path"] for s in todo]})["exists"]
+    arrived = [s for s in todo if check.get(s["new_path"])]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    try:
+        with open(MOVE_STATE) as fh:
+            log = json.load(fh)
+    except (OSError, ValueError):
+        log = []
+    log.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "from": a.src, "to": a.dst,
+                "sessions": [s["id"] for s in arrived], "folders": copy})
+    with open(MOVE_STATE, "w") as fh:
+        json.dump(log, fh, indent=1)
+    print("\n%d of %d session(s) are on %s. Resume them there with:" % (len(arrived), len(todo), a.dst))
+    for s in sorted(arrived, key=lambda s: (s["resume_in"], s["end"])):
+        print("  #%-4d %s\n        ssh %s, then: cd %s && %s" % (
+            nums[s["id"]], one_line(s["title"] or s["first_prompt"], 60), a.dst, shlex.quote(s["resume_in"]),
+            resume_cmd(s["config"], s["id"])))
+    print("\nThe originals are still on %s; nothing there was changed." % a.src)
+    if failed or len(arrived) < len(todo):
+        sys.exit(1)
+
+
 def main():
     argv = sys.argv[1:]
-    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch", "videos") else "triage"
+    command = argv[0] if argv and argv[0] in ("triage", "todo", "dispatch", "videos", "move") else "triage"
     if argv and argv[0] == command:
         argv = argv[1:]
     migrate_state()
     {"triage": claude_main, "todo": todo_main, "dispatch": dispatch_main,
-     "videos": videos_main}[command]([command] + argv)
+     "videos": videos_main, "move": move_main}[command]([command] + argv)
 
 
 if __name__ == "__main__":
